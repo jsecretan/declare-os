@@ -1,0 +1,248 @@
+/*
+# Declare OS — the desktop
+
+The root of the OS. Three faceless nodes carry the model — `wm` (the windows,
+as records), `launcher` (the apps, from apps.json), `clock` (today, as a
+fact) — and five stacked views carry the chrome, in paint order: wallpaper,
+windows, menu bar, dock.
+
+- The model: system/model.declare
+- Window chrome and window kinds: system/windows.declare
+- The dock: system/dock.declare
+- The apps: apps.json (the registry) and apps/<id>/<id>.declare
+
+This OS runs inside a host shell that owns the assistant panel. The OS asks
+for it with `app.askAssistant(text)`; the shell provides `base` (this folder,
+in the page's URL space) and `rev` (bumped whenever the agent changes a file).
+*/
+
+include [ "system/model.declare", "system/windows.declare", "system/dock.declare" ]
+
+
+/*
+## The clock — today, as a fact the menu bar reads
+*/
+
+class DesktopClock extends Time [ tick = minute,
+    text: string = { ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][this.weekday - 1] + " " + ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][this.month - 1] + " " + this.day + "  " + (this.hour % 12 == 0 ? 12 : this.hour % 12) + ":" + (this.minute < 10 ? "0" : "") + this.minute + " " + (this.hour >= 12 ? "PM" : "AM") }
+    ]
+
+
+/*
+## Wallpaper — a generative mesh field, drawn
+
+A dark hue-tinted ground with five saturated color poles melted together
+under a blur. A pure function of `seed`; drawn once at a fixed reference
+size and cover-scaled, so it never re-rasters on resize.
+*/
+
+class Wallpaper [
+    seed: number = 7,
+    refW: number = 1920,
+    refH: number = 1200,
+    width = { this.refW }, height = { this.refH },
+    x = center, y = center,
+    pivotX = { this.refW / 2 }, pivotY = { this.refH / 2 },
+    scale = { Math.max(app.width / this.refW, app.height / this.refH) },
+    draw(d: Draw) {
+        const W = this.width
+        const H = this.height
+        const hsl = (h, s, l) => "hsl(" + (((h % 360) + 360) % 360) + "," + s + "%," + l + "%)"
+        let a = (this.seed >>> 0) || 1
+        const rnd = () => {
+            a = (a + 1831565813) | 0
+            let t = Math.imul(a ^ (a >>> 15), 1 | a)
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+            }
+        const hue0 = rnd() * 360
+        const scheme = Math.floor(rnd() * 3)
+        const hueFor = () => {
+            if (scheme == 0) return hue0 + (rnd() - 0.5) * 100
+            if (scheme == 1) return hue0 + [0, 120, 240][Math.floor(rnd() * 3)] + (rnd() - 0.5) * 26
+            return rnd() < 0.72 ? hue0 + (rnd() - 0.5) * 74 : hue0 + 180 + (rnd() - 0.5) * 40
+            }
+        d.fillStyle = hsl(hue0, 52, 5)
+        d.fillRect(0, 0, W, H)
+        const spots = [[0.17, 0.24], [0.82, 0.2], [0.5, 0.54], [0.2, 0.82], [0.83, 0.8]]
+        const blurPx = Math.round(Math.max(W, H) * 0.05)
+        d.save()
+        d.filter = "blur(" + blurPx + "px)"
+        d.globalCompositeOperation = "lighten"
+        for (const s of spots) {
+            const px = (s[0] + (rnd() - 0.5) * 0.18) * W
+            const py = (s[1] + (rnd() - 0.5) * 0.18) * H
+            const r = (0.36 + rnd() * 0.26) * Math.max(W, H)
+            const h = hueFor()
+            const sat = 70 + rnd() * 22
+            const li = 44 + rnd() * 12
+            const g = d.createRadialGradient(px, py, 0, px, py, r)
+            g.addColorStop(0, hsl(h, sat, li))
+            g.addColorStop(0.5, hsl(h, sat, li * 0.62))
+            g.addColorStop(1, "rgba(0,0,0,0)")
+            d.fillStyle = g
+            d.fillRect(0, 0, W, H)
+            }
+        d.restore()
+        const v = d.createRadialGradient(W / 2, H * 0.45, H * 0.1, W / 2, H * 0.5, W * 0.72)
+        v.addColorStop(0, "rgba(0,0,0,0)")
+        v.addColorStop(1, "rgba(0,0,6,0.62)")
+        d.fillStyle = v
+        d.fillRect(0, 0, W, H)
+        const top = d.createLinearGradient(0, 0, 0, 48)
+        top.addColorStop(0, "rgba(0,0,0,0.30)")
+        top.addColorStop(1, "rgba(0,0,0,0)")
+        d.fillStyle = top
+        d.fillRect(0, 0, W, 48)
+        }
+    ]
+
+
+App [ appName = "Declare OS", scrolls = none,
+    wm: WinManager [ ],
+    clock: DesktopClock [ ],
+    launcher: Launcher [ ],
+    minWidth = 800, minHeight = 600,
+    theme = { app.darkMode ? CupertinoDark : Cupertino },
+    fontFamily = "system-ui, sans-serif",
+    fill = 0x0A0612,
+
+    menuBarH: number = 32,                       // windows live below the menu bar
+
+    // ── what the host shell provides ──
+
+    osBase: string = { hostProvided("base", "") },   // this folder, in the page's URL space
+    rev: number = { hostProvided("rev", 0) },        // bumped on every agent change
+
+    // An app's program path, relative to this folder ("apps/clock/clock"),
+    // as an island names it. Island names resolve from the page's demos/
+    // folder, hence "../" plus this folder's base; the revision segment makes
+    // a changed app a new name, so it is fetched fresh instead of reused
+    // from the island cache.
+    programPath(p: string) -> string { return p == "" ? "" : "../r" + this.rev + "/../" + (this.osBase.startsWith("/") ? this.osBase.slice(1) : this.osBase) + p },
+
+    // The assistant lives in the host shell; ask it to open (with an
+    // optional prefilled prompt).
+    askAssistant(text: string) { app.post("assistant", ({ text: text })) },
+
+    // ── appearance ──
+
+    darkLocked: boolean = false,
+    darkChoice: boolean = false,
+    darkMode: boolean = { this.darkLocked ? this.darkChoice : app.dark },
+
+    // ── the command seam: the menu bar and the keyboard route here ──
+
+    command(id: string) {
+        const cur = app.wm.activeAppId
+        if (id == "new") { if (cur != "") app.launcher.launch(cur, null) }
+        else if (id == "close") { if (app.wm.frontWin != null) app.wm.closeWin(app.wm.frontWin) }
+        else if (id == "dark") { app.darkChoice = !app.darkMode; app.darkLocked = true }
+        else if (id == "wallpaper") app.wallpaper.seed = app.wallpaper.seed + 1
+        else if (id == "about-os") app.launcher.openAbout("")
+        else if (id == "about-app") app.launcher.openAbout(cur)
+        else if (id == "quit") { if (cur != "") app.wm.quitApp(cur) }
+        else if (id == "assistant") app.askAssistant("")
+        else if (id == "jot") app.launcher.newJot("", null)
+        else if (id.indexOf("open:") == 0) app.launcher.launch(id.slice(5), null)
+        else if (id.indexOf("win:") == 0) app.wm.focusWin(app.wm.windows()[+id.slice(4)])
+        },
+
+    dockDismiss() { app.bar.dismissMenus() },
+    onPointerDown() { app.launcher.dismissAbouts() },
+    onReady() { app.launcher.openWelcome() },
+
+    keys: Keys [
+        onKeyDown(e: KeyEvent) {
+            if (!(e.meta || e.ctrl) || e.repeat || e.key == "Meta" || e.key == "Control") return
+            if (app.bar.mb.shown) return             // an open menu owns the keyboard
+            const combo = "⌘" + (e.key.length == 1 ? e.key.toUpperCase() : e.key)
+            const hit = (app.bar.keyRegistry || []).find((r) => r.key == combo && r.enabled != false)
+            if (hit != null) app.command("" + hit.id)
+            }
+        ],
+
+    wallpaper: Wallpaper [ ],
+
+    // ── the windows layer: one Window per record, built as the class the
+    // record names; record order is paint order ──
+
+    wins: View [ x = 0, y = { app.menuBarH }, width = { app.width }, height = { app.height - app.menuBarH },
+        datapath = { app.wm.list.value },
+        Window [ datapath = :wins[], key = :id,
+            classFor = { :cls == "AppWindow" ? AppWindow : :cls == "AboutWindow" ? AboutWindow
+                : :cls == "JotWindow" ? JotWindow : Window } ]
+        ],
+
+    // ── the menu bar: whole menus as records, following the front app ──
+
+    bar: View [ x = 0, y = 0, width = { app.width }, height = { app.menuBarH },
+        menuInk: Color = 0xF2F2F5,
+        activeTitle: string = { app.wm.activeAppId != "" ? app.launcher.titleOf(app.wm.activeAppId) : "Desktop" },
+
+        menus: array = { [
+            ({ id: "os", label: "✦", bold: true, items: [
+                ({ id: "about-os", label: "About Declare OS" }),
+                ({ divider: true }),
+                ({ id: "assistant", label: "Ask the Assistant…", key: "⌘J" }),
+                ({ divider: true }),
+                ({ id: "dark", label: app.darkMode ? "Light Mode" : "Dark Mode", key: "⌘K" }),
+                ({ id: "wallpaper", label: "Next Wallpaper" }),
+            ] }),
+            ({ id: "app", label: this.activeTitle, bold: true, items: this.appMenuItems() }),
+            ({ id: "file", label: "File", items: [
+                ({ id: "new", label: "New Window", enabled: app.wm.activeAppId != "" }),
+                ({ id: "jot", label: "New Jot" }),
+                ({ divider: true }),
+                ({ id: "close", label: "Close Window", enabled: app.wm.frontWin != null }),
+            ] }),
+            ({ id: "apps", label: "Apps", items: this.appItems() }),
+            ({ id: "window", label: "Window", items: this.windowItems() }),
+        ] },
+
+        appMenuItems() -> array {
+            const cur = app.wm.activeAppId
+            if (cur == "") return [({ id: "about-os", label: "About Declare OS" })]
+            const nm = app.launcher.titleOf(cur)
+            return [
+                ({ id: "about-app", label: "About " + nm }),
+                ({ divider: true }),
+                ({ id: "quit", label: "Quit " + nm }),
+                ]
+            },
+
+        // every registry app, launchable from the menu too
+        appItems() -> array {
+            const out = app.launcher.apps.map((a) => ({ id: "open:" + a.id, label: a.title }))
+            return out.length > 0 ? out : [({ id: "noapps", label: "No Apps", enabled: false })]
+            },
+
+        // the front app's open windows, front one checked
+        windowItems() -> array {
+            const cur = app.wm.activeAppId
+            const front = app.wm.frontWin
+            const ws = app.wm.windows()
+            const out = []
+            for (let i = 0; i < ws.length; i++) {
+                if (ws[i].plain || ws[i].appId != cur) continue
+                out.push(({ id: "win:" + i, label: ws[i].title || app.launcher.titleOf(cur), checked: ws[i] == front }))
+                }
+            if (out.length == 0) out.push(({ id: "nowin", label: "No Windows", enabled: false }))
+            return out
+            },
+
+        // ⌘-shortcuts dispatch from the menus' own records
+        keyRegistry: array = { (app.bar.menus || [])
+            .flatMap((m) => (m.items || []).filter((r) => r.key).map((r) => ({ menu: "" + m.label, ...r }))) },
+
+        dismissMenus() { this.mb.menu.rootClose() },
+
+        mb: MenuBar [ x = 10, height = 100%, menus = { app.bar.menus }, ink = { parent.menuInk },
+            picked(id: string) { app.command(id) }
+            ],
+        clock: Text [ x = { parent.width - this.width - 14 }, y = center, fontSize = 13,
+            fontWeight = medium, textColor = { parent.menuInk }, text = { app.clock.text } ]
+        ],
+
+    dock: Dock [ ]
+    ]

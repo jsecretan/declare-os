@@ -1,0 +1,169 @@
+schema Invader [ x: number, y: number, bx: number ]
+schema Shot [ x: number, y: number, from: string ]
+
+/*
+# Invaders — a small space invaders game
+
+The whole game is one `draw()` over plain arrays of numbers, advanced by a
+frame `Time`'s `onTick`. Keyboard and on-screen buttons only set facts
+(`heldLeft`, `wantFire`); the step reads those facts.
+*/
+
+App [ appName = "Invaders", fill = #0B0B14, textColor = #E6E6F0,
+
+    score: number = 0, lives: number = 3, running: boolean = false, won: boolean = false,
+    px: number = 0, invX: number = 0, invY: number = 0, invDir: number = 1,
+    heldLeft: boolean = false, heldRight: boolean = false, wantFire: boolean = false,
+    lastShot: number = 0, lastEnemyShot: number = 0, flashUntil: number = 0,
+    bullets: Shot[] = [], shots: Shot[] = [], invaders: Invader[] = [],
+
+    onReady() { app.ready() },
+
+    ready() { app.px = app.field.width / 2; app.newWave() },
+    start() { if (!app.running) { app.score = 0; app.lives = 3; app.ready(); app.running = true; app.won = false } },
+
+    newWave() {
+        app.invaders = []; app.bullets = []; app.shots = []
+        const w = app.field.width, cols = 8
+        const gap = Math.min(52, (w - 48) / cols)
+        const x0 = (w - gap * cols) / 2 + gap / 2
+        app.invX = 0; app.invY = 46
+        for (let r = 0; r < 3; r++)
+            for (let c = 0; c < cols; c++)
+                app.invaders.push({ x: x0 + c * gap, y: 46 + r * 34, bx: x0 + c * gap })
+        app.invDir = 1
+        },
+
+    step(dt: number) {
+        const w = app.field.width, h = app.field.height
+        const py = h - 34
+        if (app.heldLeft) app.px = app.px - 220 * dt
+        if (app.heldRight) app.px = app.px + 220 * dt
+        app.px = Math.max(18, Math.min(w - 18, app.px))
+        let mine = 0
+        for (const b of app.bullets) if (b.from == "p") mine = mine + 1
+        if (app.wantFire && mine < 3 && app.clock.now - app.lastShot > 380) {
+            app.bullets.push({ x: app.px, y: py - 14, from: "p" })
+            app.lastShot = app.clock.now
+            }
+
+        let lo = w, hi = 0
+        for (const iv of app.invaders) { if (iv.bx < lo) lo = iv.bx; if (iv.bx > hi) hi = iv.bx }
+        if (app.invaders.length > 0) {
+            const speed = 26 + (24 - app.invaders.length) * 5
+            app.invX = app.invX + app.invDir * speed * dt
+            if ((app.invDir < 0 && lo + app.invX - 14 <= 12) || (app.invDir > 0 && hi + app.invX + 14 >= w - 12)) {
+                app.invDir = -app.invDir
+                app.invX = app.invX + app.invDir * speed * dt
+                app.invY = app.invY + 14
+                }
+            for (const iv of app.invaders) { iv.x = iv.bx + app.invX; iv.y = app.invY }
+            }
+
+        if (app.invaders.length > 0 && app.clock.now - app.lastEnemyShot > 950) {
+            const iv = app.invaders[Math.floor(Math.random() * app.invaders.length)]
+            app.shots.push({ x: iv.x, y: iv.y + 12, from: "e" })
+            app.lastEnemyShot = app.clock.now
+            }
+
+        for (const b of app.bullets) b.y = b.y - 420 * dt
+        for (const s of app.shots) s.y = s.y + 190 * dt
+
+        for (let i = app.bullets.length - 1; i >= 0; i--) {
+            const b = app.bullets[i]
+            if (b.y < -10) { app.bullets.splice(i, 1); continue }
+            if (b.from != "p") continue
+            for (let j = app.invaders.length - 1; j >= 0; j--) {
+                const iv = app.invaders[j]
+                if (Math.abs(iv.x - b.x) < 16 && Math.abs(iv.y - b.y) < 13) {
+                    app.invaders.splice(j, 1); app.bullets.splice(i, 1)
+                    app.score = app.score + 10
+                    break
+                    }
+                }
+            }
+        for (let i = app.shots.length - 1; i >= 0; i--) {
+            const s = app.shots[i]
+            if (s.y > h + 10) { app.shots.splice(i, 1); continue }
+            if (Math.abs(s.x - app.px) < 16 && s.y > py - 10 && s.y < py + 12) {
+                app.shots.splice(i, 1)
+                app.lives = app.lives - 1
+                app.flashUntil = app.clock.now + 250
+                if (app.lives <= 0) { app.running = false; app.won = false }
+                }
+            }
+
+        if (app.invaders.length == 0) { app.running = false; app.won = true; app.score = app.score + 50 }
+        for (const iv of app.invaders) if (iv.y >= py - 12) { app.running = false; app.won = false }
+        },
+
+    keys: Keys [
+        onKeyDown(e: KeyEvent) {
+            if (e.code == "ArrowLeft" || e.code == "KeyA") app.heldLeft = true
+            else if (e.code == "ArrowRight" || e.code == "KeyD") app.heldRight = true
+            else if (e.code == "Space") app.wantFire = true
+            else if (e.code == "Enter" && !app.running) app.start()
+            },
+        onKeyUp(e: KeyEvent) {
+            if (e.code == "ArrowLeft" || e.code == "KeyA") app.heldLeft = false
+            else if (e.code == "ArrowRight" || e.code == "KeyD") app.heldRight = false
+            else if (e.code == "Space") app.wantFire = false
+            }
+        ],
+
+    clock: Time [ tick = frame, running = { app.running }, onTick(dt: number) { app.step(Math.min(dt, 0.05)) } ],
+
+    hud: View [ x = 16, y = 10,
+        layout: SimpleLayout [ axis = x, spacing = 16 ],
+        Text [ fontSize = 14, fontWeight = medium, textColor = #8E8EA6, text = { "SCORE  " + app.score } ],
+        Text [ fontSize = 14, textColor = #8E8EA6, text = { "♥".repeat(Math.max(0, app.lives)) } ]
+        ],
+
+    field: View [ x = 0, y = 40, width = 100%, height = { parent.height - 96 },
+        draw(d: Draw) {
+            d.fillStyle = "#12122A"; d.fillRect(0, 0, this.width, this.height)
+            d.fillStyle = "#2A2A45"
+            for (let i = 0; i < 40; i++) {
+                const sx = (i * 97) % this.width, sy = (i * 53) % (this.height - 60)
+                d.fillRect(sx, sy, 2, 2)
+                }
+            const py = this.height - 34
+            const hit = app.clock.now < app.flashUntil
+            d.fillStyle = hit ? "#FF6B5B" : "#4FD8A6"
+            d.fillRect(app.px - 16, py, 32, 10)
+            d.fillRect(app.px - 3, py - 8, 6, 8)
+            d.fillStyle = "#FFD24A"
+            for (const iv of app.invaders) {
+                d.fillRect(iv.x - 14, iv.y - 8, 28, 14)
+                d.fillRect(iv.x - 10, iv.y + 6, 6, 4)
+                d.fillRect(iv.x + 4, iv.y + 6, 6, 4)
+                d.fillStyle = "#12122A"
+                d.fillRect(iv.x - 8, iv.y - 4, 4, 4)
+                d.fillRect(iv.x + 4, iv.y - 4, 4, 4)
+                d.fillStyle = "#FFD24A"
+                }
+            d.fillStyle = "#FFFFFF"
+            for (const b of app.bullets) d.fillRect(b.x - 1.5, b.y - 8, 3, 10)
+            d.fillStyle = "#FF6B5B"
+            for (const s of app.shots) d.fillRect(s.x - 1.5, s.y, 3, 12)
+            }
+        ],
+
+    overlay: View [ x = 0, y = 40, width = 100%, height = { parent.height - 96 },
+        visible = { !app.running }, fill = { gradient(0x0B0B14CC, 0x0B0B14CC) },
+        layout: SimpleLayout [ axis = y, spacing = 8, align = center ],
+        Text [ width = 100%, textAlign = center, fontSize = 26, fontWeight = bold,
+            textColor = { app.won ? 0x4FD8A6 : 0xE6E6F0 },
+            text = { app.won ? "Sector cleared!" : app.lives <= 0 ? "Game over" : "Space Invaders" } ],
+        Text [ width = 100%, textAlign = center, fontSize = 13, textColor = #8E8EA6,
+            text = { app.won || app.lives <= 0 ? "Score " + app.score + " — press Enter to play again" : "← → move · Space fires · Enter starts" } ]
+        ],
+
+    controls: View [ x = center, y = { parent.height - 52 },
+        layout: SimpleLayout [ axis = x, spacing = 10, align = center ],
+        Button [ label = "◀", onPointerDown() { app.heldLeft = true }, onPointerUp() { app.heldLeft = false } ],
+        Button [ label = "Fire", primary = true,
+            onPointerDown() { app.wantFire = true }, onPointerUp() { app.wantFire = false } ],
+        Button [ label = "▶", onPointerDown() { app.heldRight = true }, onPointerUp() { app.heldRight = false } ]
+        ]
+    ]

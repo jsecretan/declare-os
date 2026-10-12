@@ -1,0 +1,520 @@
+// The agent bridge: one long-lived `pi --mode rpc` process working in os/,
+// its event stream turned into chat operations the shell applies, and the
+// bookkeeping around each turn — a git snapshot before, verification after
+// (with automatic repair), a commit, and a revision bump that tells the shell
+// to remount the OS.
+//
+// HTTP surface (proxied from the Declare dev server under /api):
+//   GET  /api/events            SSE: {op:"reset"|"push"|"append"|"patch"|"state", …}
+//   POST /api/prompt  {text}    start a turn
+//   POST /api/abort             stop the running turn
+//   POST /api/undo              revert the last agent change
+//   POST /api/factory           restore the OS to its first commit
+//   POST /api/newchat           fresh agent session + empty transcript
+//   GET|PUT /api/store/<app>/<key>   a tiny JSON store for apps
+
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const OS = path.join(ROOT, "os");
+const STATE = path.join(ROOT, "state");
+const STORE = path.join(STATE, "store");
+const VERIFY = path.join(ROOT, "node_modules/declarelang/tools/verify.mjs");
+
+const PORT = +(process.env.AGENT_PORT || 8851);
+const PROVIDER = process.env.PI_PROVIDER || "strata";
+const MODEL = process.env.PI_MODEL || "qwen3.8-flash-next-iq3_s";
+const STRATA_HEALTH = process.env.STRATA_HEALTH || "http://127.0.0.1:8080/health";
+const MAX_REPAIRS = 2;
+
+fs.mkdirSync(STORE, { recursive: true });
+
+// ── git: os/ has its own history; every agent turn is a commit ──────────
+// The history lives in state/os.git (outside os/), so os/ stays plain files
+// in the project's own repository. A fresh checkout starts it from whatever
+// os/ holds, and that first commit is the factory state.
+
+const OS_GIT = path.join(STATE, "os.git");
+async function git(...args) {
+  const { stdout } = await run("git", ["--git-dir", OS_GIT, "--work-tree", OS, ...args], { cwd: OS, maxBuffer: 16 << 20 });
+  return stdout.trim();
+}
+async function ensureRepo() {
+  if (!fs.existsSync(OS_GIT)) {
+    await git("init", "-q", "-b", "main");
+    await git("config", "user.name", "Declare OS");
+    await git("config", "user.email", "os@localhost");
+    await git("add", "-A");
+    await git("commit", "-q", "-m", "factory: the base OS");
+    await git("tag", "factory");
+  }
+}
+async function dirty() { return (await git("status", "--porcelain")) !== ""; }
+async function head() { return git("rev-parse", "HEAD"); }
+async function commitAll(msg) {
+  if (!(await dirty())) return false;
+  await git("add", "-A");
+  await git("commit", "-q", "-m", msg.slice(0, 200));
+  return true;
+}
+
+// ── the transcript and its subscribers ──────────────────────────────────
+
+const state = {
+  blocks: [],            // { id, kind: user|assistant|thinking|tool|system, text, name?, status?, output? }
+  busy: false,
+  rev: 1,                // the shell remounts the OS when this moves
+  broken: "",            // the desktop's verification failure, "" when it is sound
+  model: "unknown",      // ready | asleep | loading | offline
+  canUndo: false,
+};
+let seq = 0;
+const clients = new Set();
+
+function send(res, msg) { res.write(`data: ${JSON.stringify(msg)}\n\n`); }
+function broadcast(msg) { for (const c of clients) send(c, msg); }
+function stateMsg() {
+  return { op: "state", busy: state.busy, rev: state.rev, broken: state.broken, model: state.model, canUndo: state.canUndo };
+}
+function pushBlock(b) {
+  foldThinking();
+  const block = { id: "b" + ++seq, text: "", ...b };
+  state.blocks.push(block);
+  broadcast({ op: "push", block });
+  return state.blocks.length - 1;
+}
+function patchBlock(i, fields) {
+  flushAppends();
+  Object.assign(state.blocks[i], fields);
+  broadcast({ op: "patch", i, fields });
+}
+// a thinking block streams open; anything after it folds it to "Thought"
+function foldThinking() {
+  const i = state.blocks.length - 1;
+  if (i >= 0 && state.blocks[i].kind === "thinking" && state.blocks[i].status !== "done") patchBlock(i, { status: "done" });
+}
+function system(text) { flushAppends(); return pushBlock({ kind: "system", text }); }
+function setState(fields) { Object.assign(state, fields); broadcast(stateMsg()); }
+
+// text deltas arrive per token; coalesce them to ~20 updates a second
+const pending = new Map();   // block index → buffered text
+let flushTimer = null;
+function append(i, text) {
+  state.blocks[i].text += text;
+  pending.set(i, (pending.get(i) || "") + text);
+  if (!flushTimer) flushTimer = setTimeout(flushAppends, 50);
+}
+function flushAppends() {
+  clearTimeout(flushTimer);
+  flushTimer = null;
+  for (const [i, text] of pending) broadcast({ op: "append", i, text });
+  pending.clear();
+}
+
+// ── pi ──────────────────────────────────────────────────────────────────
+
+let pi = null;
+let cmdSeq = 0;
+const waiting = new Map();   // command id → resolve
+
+function systemPrompt() {
+  return fs.readFileSync(path.join(OS, "AGENTS.md"), "utf8");
+}
+
+function startPi() {
+  const args = [
+    "--mode", "rpc", "--no-session",
+    "--provider", PROVIDER, "--model", MODEL,
+    "--no-context-files", "--no-skills", "--no-prompt-templates",
+    "--append-system-prompt", systemPrompt(),
+  ];
+  if (!process.env.PI_EXTENSIONS) args.push("--no-extensions", "--no-mcp");
+  pi = spawn("pi", args, { cwd: OS, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env } });
+  let buf = "";
+  pi.stdout.setEncoding("utf8");
+  pi.stdout.on("data", (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {   // records split on LF only (never readline)
+      let line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      if (!line.trim()) continue;
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      onRecord(rec);
+    }
+  });
+  pi.stderr.setEncoding("utf8");
+  pi.stderr.on("data", (d) => process.stderr.write("[pi] " + d));
+  pi.on("exit", (code) => {
+    pi = null;
+    if (state.busy) { system(`The agent process exited (code ${code}).`); finishTurn(true); }
+  });
+}
+
+function command(cmd) {
+  if (!pi) startPi();
+  const id = "c" + ++cmdSeq;
+  return new Promise((resolve) => {
+    waiting.set(id, resolve);
+    pi.stdin.write(JSON.stringify({ id, ...cmd }) + "\n");
+  });
+}
+
+// per assistant message: content index → transcript block
+let blockOf = new Map();
+const toolBlock = new Map();  // toolCallId → transcript block
+
+// ── tool calls, told in the user's terms ─────────────────────────────────
+// The person at the panel is using an OS, not reading its source: "Changing
+// the Clock app", not `edit apps/clock/clock.declare`.
+
+function appLabels() {
+  try {
+    const reg = JSON.parse(fs.readFileSync(path.join(OS, "apps.json"), "utf8"));
+    return Object.fromEntries((reg.apps || []).map((a) => [a.id, a.label || a.title || a.id]));
+  } catch { return {}; }
+}
+function rel(p) {
+  if (!p) return "";
+  p = String(p).replace(/^["']|["']$/g, "");
+  if (path.isAbsolute(p)) p = path.relative(OS, p);
+  return p.replace(/^\.\//, "");
+}
+const SYSTEM_PARTS = {
+  "desktop.declare": "the desktop",
+  "system/dock.declare": "the dock",
+  "system/windows.declare": "the windows",
+  "system/model.declare": "the app launcher",
+  "apps.json": "the app list",
+  "AGENTS.md": "its notes",
+};
+// what a file is, to the person using the OS
+function thing(p) {
+  p = rel(p);
+  const m = p.match(/^apps\/([^/]+)/);
+  if (m) {
+    const label = appLabels()[m[1]] || m[1].replace(/[-_]/g, " ").replace(/^./, (c) => c.toUpperCase());
+    return `the ${label} app`;
+  }
+  if (SYSTEM_PARTS[p]) return SYSTEM_PARTS[p];
+  if (p.startsWith("..") || p.includes("node_modules/declarelang")) return "the Declare guide";
+  if (p === "" || p === "." || p === "apps") return "the system";
+  return "the system";
+}
+function bashTarget(cmd) {
+  const f = cmd.match(/(?:\.\.\/|\/)?[\w./-]*\.(?:declare|json|md)\b/);
+  return f ? thing(f[0]) : /\bapps\b/.test(cmd) ? "the apps" : "the system";
+}
+function describe(name, a = {}) {
+  if (name === "read") return "Looking at " + thing(a.path);
+  if (name === "edit") return "Changing " + thing(a.path);
+  if (name === "write") {
+    const exists = a.path && fs.existsSync(path.resolve(OS, rel(a.path)));
+    return (exists ? "Rewriting " : "Creating ") + thing(a.path);
+  }
+  if (name === "bash") {
+    const c = a.command || "";
+    if (/declare-verify|verify\.mjs/.test(c)) return "Testing " + bashTarget(c);
+    if (/declare-help/.test(c)) return "Looking something up in the Declare guide";
+    if (/^\s*(ls|cat|head|tail|grep|rg|find|sed -n|wc|tree)\b/.test(c)) return "Looking through " + bashTarget(c);
+    if (/^\s*(mkdir|cp|mv)\b/.test(c)) return "Setting up files";
+    return "Running a quick task";
+  }
+  if (name === "grep" || name === "find" || name === "ls") return "Looking through " + (a.path ? thing(a.path) : "the system");
+  return "Working";
+}
+function summaryOf(files) {
+  const names = [...new Set(files.map(thing))];
+  if (names.length <= 1) return names[0] || "the system";
+  return names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+}
+
+function onRecord(r) {
+  if (r.type === "response") {
+    const done = waiting.get(r.id);
+    if (done) { waiting.delete(r.id); done(r); }
+    return;
+  }
+  switch (r.type) {
+    case "message_start":
+      if (r.message?.role === "assistant") blockOf = new Map();
+      break;
+    case "message_update": {
+      const e = r.assistantMessageEvent || {};
+      const ci = e.contentIndex;
+      if (e.type === "text_start") blockOf.set(ci, pushBlock({ kind: "assistant" }));
+      else if (e.type === "thinking_start") blockOf.set(ci, pushBlock({ kind: "thinking" }));
+      else if (e.type === "thinking_end") { if (blockOf.has(ci)) patchBlock(blockOf.get(ci), { status: "done" }); }
+      else if (e.type === "text_delta" || e.type === "thinking_delta") {
+        if (!blockOf.has(ci)) blockOf.set(ci, pushBlock({ kind: e.type === "text_delta" ? "assistant" : "thinking" }));
+        append(blockOf.get(ci), e.delta || "");
+      }
+      break;
+    }
+    case "message_end": {
+      const m = r.message || {};
+      if (m.role === "assistant" && m.stopReason === "aborted") break;
+      if (m.role === "assistant" && (m.stopReason === "error" || m.errorMessage))
+        system("Model error: " + (m.errorMessage || "unknown"));
+      flushAppends();
+      break;
+    }
+    case "tool_execution_start": {
+      const text = describe(r.toolName, r.args);
+      // the same step again right after itself ("Looking at the dock", twice) is one line
+      const last = state.blocks.length - 1;
+      const prev = state.blocks[last];
+      if (prev && prev.kind === "tool" && prev.text === text && prev.status !== "running") {
+        patchBlock(last, { status: "running" });
+        toolBlock.set(r.toolCallId, last);
+      } else toolBlock.set(r.toolCallId, pushBlock({ kind: "tool", name: r.toolName, text, status: "running" }));
+      break;
+    }
+    case "tool_execution_end": {
+      const i = toolBlock.get(r.toolCallId);
+      toolBlock.delete(r.toolCallId);
+      if (i == null) break;
+      const b = state.blocks[i];
+      // only a failed test is news to the person; a search that found nothing isn't
+      if (r.isError && b.text.startsWith("Testing ")) patchBlock(i, { status: "error", text: b.text + " — found something to fix" });
+      else patchBlock(i, { status: r.isError && r.toolName !== "bash" ? "error" : "ok" });
+      break;
+    }
+    case "auto_retry_start":
+      system(`Retrying (attempt ${r.attempt}/${r.maxAttempts}): ${r.errorMessage || ""}`);
+      break;
+    case "compaction_start":
+      system("Compacting the conversation to fit the model's context…");
+      break;
+    case "agent_settled":
+      flushAppends();
+      afterTurn(r.aborted).catch((e) => { system("Post-turn check failed: " + e.message); finishTurn(false); });
+      break;
+    case "extension_ui_request":
+      // no UI to answer with: decline so the agent never blocks
+      if (pi) pi.stdin.write(JSON.stringify({ type: "extension_ui_response", id: r.id, cancelled: true }) + "\n");
+      break;
+  }
+}
+
+// ── a turn ──────────────────────────────────────────────────────────────
+
+let turn = null;   // { prompt, before, repairs }
+const undoStack = [];
+
+async function startTurn(text) {
+  if (state.busy) return { ok: false, error: "busy" };
+  setState({ busy: true });
+  pushBlock({ kind: "user", text });
+  try {
+    if (await commitAll("manual edits")) system("Saved your manual edits as a snapshot first.");
+    turn = { prompt: text, before: await head(), repairs: 0 };
+    const r = await command({ type: "prompt", message: text });
+    if (!r.success) { system("The agent refused the prompt: " + r.error); finishTurn(false); }
+    else if (r.data?.disposition === "handled") finishTurn(false);
+  } catch (e) {
+    system("Could not start the agent: " + e.message);
+    finishTurn(false);
+  }
+  return { ok: true };
+}
+
+// what to check: the desktop when anything of the OS moved, each app whose
+// folder moved, and the registry
+async function verifyChanged(before) {
+  const changed = (await git("diff", "--name-only", before)).split("\n")
+    .concat((await git("ls-files", "--others", "--exclude-standard")).split("\n"))
+    .filter(Boolean);
+  const problems = [];
+  let desktopBad = "";
+  const targets = new Set();
+  for (const f of changed) {
+    const m = f.match(/^apps\/([^/]+)\//);
+    if (m) { const main = `apps/${m[1]}/${m[1]}.declare`; if (fs.existsSync(path.join(OS, main))) targets.add(main); }
+    else if (f.endsWith(".declare")) targets.add("desktop.declare");
+  }
+  if (changed.includes("apps.json")) {
+    try {
+      const reg = JSON.parse(fs.readFileSync(path.join(OS, "apps.json"), "utf8"));
+      const ids = new Set();
+      for (const a of reg.apps || []) {
+        if (!a.id || !a.label || !a.title || !a.kind) problems.push(`apps.json: app ${JSON.stringify(a.id)} needs id, label, title and kind`);
+        if (ids.has(a.id)) problems.push(`apps.json: duplicate id "${a.id}"`);
+        ids.add(a.id);
+        if (a.kind === "program") {
+          const main = (a.program || "") + ".declare";
+          if (!a.program || !fs.existsSync(path.join(OS, main))) problems.push(`apps.json: app "${a.id}" names program "${a.program}", but ${main} does not exist`);
+          else targets.add(main);
+        }
+      }
+    } catch (e) { problems.push("apps.json is not valid JSON: " + e.message); }
+  }
+  for (const t of targets) {
+    let out;
+    try { out = (await run("node", [VERIFY, t], { cwd: OS, timeout: 120000, maxBuffer: 8 << 20 })).stdout; }
+    catch (e) { out = (e.stdout || "") + (e.stderr || ""); }
+    if (!/clean through R4/.test(out)) {
+      const lines = out.split("\n").filter((l) => /✗|DECLARE|hint|FAILED|line \d|:\d+:\d+/.test(l)).join("\n");
+      problems.push(`${t}:\n${lines || out.slice(-1500)}`);
+      if (t === "desktop.declare") desktopBad = lines || "the desktop does not compile";
+    }
+  }
+  return { changed, problems, desktopBad, checked: [...targets] };
+}
+
+async function afterTurn(aborted) {
+  if (!turn) { finishTurn(false); return; }
+  if (!(await dirty())) { finishTurn(false); return; }
+  const v = await verifyChanged(turn.before);
+  if (v.problems.length && !aborted && turn.repairs < MAX_REPAIRS) {
+    turn.repairs++;
+    system(`The change to ${summaryOf(v.changed)} doesn't work yet — fixing it (try ${turn.repairs} of ${MAX_REPAIRS}).`);
+    const msg = "The OS verifier found these problems with your change. Fix them, then run `npx declare-verify` on each file again until it reports \"clean through R4\":\n\n" + v.problems.join("\n\n");
+    const r = await command({ type: "prompt", message: msg });
+    if (!r.success) { system("Repair prompt refused: " + r.error); await commitTurn(v); }
+    return;
+  }
+  await commitTurn(v, aborted);
+}
+
+async function commitTurn(v, aborted = false) {
+  const label = (aborted ? "agent (stopped): " : "agent: ") + turn.prompt;
+  await commitAll(label);
+  undoStack.push({ before: turn.before, after: await head(), prompt: turn.prompt });
+  console.log(`[turn] ${label} → ${v.changed.join(", ")}${v.problems.length ? "\n" + v.problems.join("\n") : ""}`);
+  if (v.problems.length) system(`The change to ${summaryOf(v.changed)} still has a problem I couldn't fix. It's kept so you can try it — Undo takes it back.`);
+  else system(`Done — updated ${summaryOf(v.changed)}.`);
+  // a broken desktop is not remounted: the shell keeps the last good OS running
+  const rev = v.desktopBad ? state.rev : state.rev + 1;
+  finishTurn(false, { rev, broken: v.desktopBad });
+}
+
+function finishTurn(_crashed, extra = {}) {
+  turn = null;
+  flushAppends();
+  foldThinking();
+  setState({ busy: false, canUndo: undoStack.length > 0, ...extra });
+}
+
+async function undo() {
+  if (state.busy) return { ok: false, error: "busy" };
+  const last = undoStack.pop();
+  if (!last) return { ok: false, error: "nothing to undo" };
+  await commitAll("manual edits");
+  await git("revert", "--no-edit", `${last.before}..${last.after}`);
+  system(`Undid: “${last.prompt}”`);
+  setState({ rev: state.rev + 1, broken: "", canUndo: undoStack.length > 0 });
+  return { ok: true };
+}
+
+async function factory() {
+  if (state.busy) return { ok: false, error: "busy" };
+  // the `factory` tag marks the shipped OS (move it to adopt a new baseline)
+  let root;
+  try { root = await git("rev-parse", "-q", "--verify", "refs/tags/factory"); }
+  catch { root = (await git("rev-list", "--max-parents=0", "HEAD")).split("\n")[0]; }
+  await commitAll("manual edits");
+  // AGENTS.md is the agent's instructions, not part of the OS: it survives a reset
+  const notes = fs.readFileSync(path.join(OS, "AGENTS.md"), "utf8");
+  await git("read-tree", "-u", "--reset", root);
+  await git("clean", "-fdq");
+  fs.writeFileSync(path.join(OS, "AGENTS.md"), notes);
+  await commitAll("factory reset");
+  undoStack.length = 0;
+  system("Restored the OS to its factory state.");
+  setState({ rev: state.rev + 1, broken: "", canUndo: false });
+  return { ok: true };
+}
+
+async function newChat() {
+  if (state.busy) return { ok: false, error: "busy" };
+  if (pi) await command({ type: "new_session" });
+  state.blocks = [];
+  broadcast({ op: "reset", blocks: [] });
+  return { ok: true };
+}
+
+// ── the model's health, for the panel's status dot ──────────────────────
+
+async function pollModel() {
+  let model = "offline";
+  try {
+    const r = await fetch(STRATA_HEALTH, { signal: AbortSignal.timeout(2500) });
+    const h = await r.json();
+    // Strata idles its engine down; the first request wakes it (1–3 min)
+    model = h.status !== "ok" ? "loading" : h.loaded ? "ready" : (state.busy ? "loading" : "asleep");
+  } catch {}
+  if (model !== state.model) setState({ model });
+}
+
+// ── HTTP ────────────────────────────────────────────────────────────────
+
+function body(req) {
+  return new Promise((resolve) => {
+    let s = "";
+    req.on("data", (d) => (s += d));
+    req.on("end", () => { try { resolve(s ? JSON.parse(s) : {}); } catch { resolve({}); } });
+  });
+}
+function json(res, code, obj) {
+  res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify(obj));
+}
+const safe = (s) => /^[A-Za-z0-9_.-]{1,80}$/.test(s) && !s.startsWith(".");
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://x");
+  const p = url.pathname;
+  try {
+    if (p === "/api/events") {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+      res.write("retry: 1500\n\n");
+      send(res, { op: "reset", blocks: state.blocks });
+      send(res, stateMsg());
+      clients.add(res);
+      const ping = setInterval(() => res.write(": ping\n\n"), 20000);
+      req.on("close", () => { clearInterval(ping); clients.delete(res); });
+      return;
+    }
+    if (req.method === "POST" && p === "/api/prompt") {
+      const { text } = await body(req);
+      if (!text || !String(text).trim()) return json(res, 400, { ok: false, error: "empty" });
+      return json(res, 200, await startTurn(String(text).trim()));
+    }
+    if (req.method === "POST" && p === "/api/abort") { if (pi && state.busy) await command({ type: "abort" }); return json(res, 200, { ok: true }); }
+    if (req.method === "POST" && p === "/api/undo") return json(res, 200, await undo());
+    if (req.method === "POST" && p === "/api/factory") return json(res, 200, await factory());
+    if (req.method === "POST" && p === "/api/newchat") return json(res, 200, await newChat());
+    const m = p.match(/^\/api\/store\/([^/]+)\/([^/]+)$/);
+    if (m && safe(m[1]) && safe(m[2])) {
+      const file = path.join(STORE, m[1], m[2] + ".json");
+      if (req.method === "GET") {
+        if (!fs.existsSync(file)) return json(res, 200, null);
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        return res.end(fs.readFileSync(file));
+      }
+      if (req.method === "PUT" || req.method === "POST") {
+        const v = await body(req);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(v));
+        return json(res, 200, v);
+      }
+    }
+    json(res, 404, { ok: false, error: "not found" });
+  } catch (e) {
+    json(res, 500, { ok: false, error: e.message });
+  }
+});
+
+await ensureRepo();
+await pollModel();
+setInterval(pollModel, 10000);
+server.listen(PORT, "127.0.0.1", () => console.log(`agent bridge → http://127.0.0.1:${PORT}/api  (pi: ${PROVIDER}/${MODEL}, workspace: ${OS})`));

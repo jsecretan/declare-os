@@ -1,0 +1,85 @@
+/*
+# Word Processor — one document, autosaved
+
+- the title, the text, its size, family and weight are the one source of truth.
+- `page` owns its own edit session: it is seeded once, by the loader, and never
+  re-constrained — a `text = { app.body }` constraint would write the text back
+  into the field on every keystroke and swallow the caret.
+- `loader` reads the saved copy from the OS store once at start; every edit
+  schedules `save()`, which writes the whole document back after a short pause.
+*/
+
+App [ appName = "Word Processor",
+    theme = { hostProvided("dark", app.dark) ? CupertinoDark : Cupertino },
+    fill = { provided("theme").background },
+
+    storeUrl: string = { hostProvided("store", "/api/store/writer/") + "doc" },
+
+    title: string = "Untitled",
+    body: string = "",
+    size: number = 16,
+    family: string = "sans",
+    bold: boolean = false,
+
+    doc: View [ width = 100%, height = 100%,
+        layout: SimpleLayout [ axis = y ],
+
+        bar: View [ width = 100%, padding = 12,
+            layout: SimpleLayout [ axis = x, spacing = 10, align = center ],
+            docName: TextInput [ width = 180, placeholder = "Untitled",
+                onInput() { app.title = this.text; app.saveSoon() } ],
+            Button [ label = "B", fontWeight = bold, primary = { app.bold },
+                onClick() { app.bold = !app.bold; app.saveSoon() } ],
+            Segmented [ choices = [ "13", "16", "20", "26" ], value = { "" + app.size },
+                input(v: object) { app.size = Number(v); app.saveSoon() } ],
+            Segmented [ choices = [ "Sans", "Serif", "Mono" ], value = { app.family },
+                input(v: object) { app.family = "" + v; app.saveSoon() } ],
+            Text [ text = { words(app.body) + " words · " + app.body.length + " chars" },
+                fontSize = 12, textColor = { provided("theme").textMuted } ]
+            ],
+
+        Divider [ width = 100% ],
+
+        page: TextInput [ width = 100%, height = { parent.height - app.doc.bar.height - 1 },
+            scrolls = y, multiline = true, wrap = true, spellcheck = false,
+            placeholder = "Start typing…",
+            fontSize = { app.size },
+            fontFamily = { FONTS[app.family] },
+            fontWeight = { app.bold ? "bold" : "normal" },
+            textColor = { provided("theme").text },
+            padding = 20,
+            onInput() { app.body = this.text; app.saveSoon() }
+            ]
+        ],
+
+    loader: DataSource [ url = { app.storeUrl }, auto = true,
+        onLoad() {
+            const d = this.value
+            if (d) {
+                app.title = d.title ?? "Untitled"
+                app.size = d.size ?? 16
+                app.family = d.family ?? "sans"
+                app.bold = d.bold ?? false
+                app.body = d.body ?? ""
+                }
+            app.doc.page.text = app.body
+            app.doc.bar.docName.text = app.title
+            }
+        ],
+    saver: DataSource [ url = { app.storeUrl }, method = "PUT" ],
+    save() { app.saver.body = ({ title: app.title, body: app.body, size: app.size, family: app.family, bold: app.bold }); app.saver.fetch() },
+    saveSoon() {
+        app.saveTimer = app.saveTimer + 1
+        const stamp = app.saveTimer
+        afterDelay(600, () => { if (stamp == app.saveTimer) app.save() })
+        },
+    saveTimer: number = 0
+    ]
+
+script {
+    const FONTS = ({ sans: "system-ui", serif: "Georgia, serif", mono: "ui-monospace, monospace" })
+    function words(s: string): number {
+        const t = s.trim()
+        return t == "" ? 0 : t.split(/\s+/).length
+        }
+    }

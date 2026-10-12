@@ -1,0 +1,128 @@
+/*
+# Pomodoro — a focus timer
+
+The countdown is one number, `left` (milliseconds still to run):
+
+- while running, the shown time is derived from `endsAt` and the clock, so a
+  `Time [ tick = frame ]` keeps the ring and the digits moving by constraint;
+- `afterDelay` announces the end, and a `runId` token makes a stale alarm
+  harmless — pausing or resetting bumps the token, so the old alarm is ignored.
+- completed sessions are saved to the OS store, the way To-Do saves its list.
+*/
+
+schema Pomo [ completed: number, focusMin: number ]
+
+script {
+    function mmss(ms: number): string {
+        const m = Math.floor(ms / 60000)
+        const s = Math.floor((ms % 60000) / 1000)
+        return m + ":" + (s < 10 ? "0" : "") + s
+        }
+    }
+
+App [ appName = "Pomodoro",
+    night: boolean = { hostProvided("dark", app.dark) },
+    theme = { app.night ? CupertinoDark : Cupertino },
+    fill = { provided("theme").background },
+
+    t: Time [ tick = frame ],
+
+    focusMin: number = 25,
+    breakMin: number = 5,
+    onBreak: boolean = false,
+    running: boolean = false,
+    left: number = { 25 * 60000 },
+    endsAt: number = 0,
+    runId: number = 0,
+    completed: number = 0,
+
+    total: number = { (app.onBreak ? app.breakMin : app.focusMin) * 60000 },
+    shown: number = { app.running ? Math.max(0, app.endsAt - app.t.now) : app.left },
+
+    storeUrl: string = { hostProvided("store", "/api/store/pomodoro/") + "state" },
+    saved: Dataset [ schema = [ completed: number, focusMin: number ] ] { { "completed": 0, "focusMin": 25 } },
+    loader: DataSource [ url = { app.storeUrl }, auto = true, schema = [ completed: number, focusMin: number ],
+        onLoad() {
+            const v = this.value
+            if (!v) return
+            app.completed = v.completed ?? 0
+            app.focusMin = v.focusMin ?? 25
+            if (!app.running && !app.onBreak) app.left = app.focusMin * 60000
+            }
+        ],
+    saver: DataSource [ url = { app.storeUrl }, method = "PUT" ],
+    save() { app.saver.body = ({ completed: app.completed, focusMin: app.focusMin }); app.saver.fetch() },
+
+    start() {
+        if (app.left <= 0) return
+        app.runId = app.runId + 1
+        const id = app.runId
+        app.endsAt = app.t.now + app.left
+        app.running = true
+        afterDelay(app.left, () => { if (app.runId == id) app.finish() })
+        },
+    pause() {
+        if (!app.running) return
+        app.runId = app.runId + 1
+        app.left = Math.max(0, app.endsAt - app.t.now)
+        app.running = false
+        },
+    reset() {
+        app.runId = app.runId + 1
+        app.running = false
+        app.left = app.total
+        },
+    pick(min: number) {
+        app.focusMin = min
+        if (!app.onBreak) { app.runId = app.runId + 1; app.running = false; app.left = min * 60000 }
+        app.save()
+        },
+    finish() {
+        app.runId = app.runId + 1
+        app.running = false
+        if (!app.onBreak) { app.completed = app.completed + 1; app.save() }
+        app.onBreak = !app.onBreak
+        app.left = app.total
+        },
+
+    col: View [ width = 100%, height = 100%, padding = 18,
+        layout: SimpleLayout [ axis = y, spacing = 14, align = center ],
+
+        phase: Text [ fontSize = 15, fontWeight = medium, text = { app.onBreak ? "Break" : "Focus" },
+            textColor = { app.onBreak ? 0x30D158 : 0xFF9F0A } ],
+
+        dial: View [ width = { Math.max(90, Math.min(parent.width - 36, parent.height - 190)) },
+            height = { this.width },
+            ring: View [ width = 100%, height = 100%,
+                draw(d: Draw) {
+                    const r = this.width / 2
+                    d.translate(r, r)
+                    d.lineCap = "round"
+                    d.lineWidth = 9
+                    d.strokeStyle = app.night ? "#2C2C2E" : "#E2E2E9"
+                    d.beginPath(); d.arc(0, 0, r - 8, 0, Math.PI * 2); d.stroke()
+                    const frac = app.total > 0 ? 1 - app.shown / app.total : 0
+                    if (frac > 0) {
+                        d.strokeStyle = app.onBreak ? "#30D158" : "#FF9F0A"
+                        d.beginPath(); d.arc(0, 0, r - 8, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); d.stroke()
+                        }
+                    }
+                ],
+            readout: Text [ x = center, y = center, fontSize = 40, fontWeight = bold,
+                textColor = { provided("theme").text }, text = { mmss(app.shown) } ]
+            ],
+
+        controls: View [ layout: SimpleLayout [ axis = x, spacing = 10, align = center ],
+            Button [ label = { app.running ? "Pause" : "Start" }, primary = true,
+                onClick() { app.running ? app.pause() : app.start() } ],
+            Button [ label = "Reset", onClick() { app.reset() } ]
+            ],
+
+        lengths: Segmented [ width = 190, height = 30, disabled = { app.running },
+            choices = [ 15, 25, 50 ], value = { app.focusMin },
+            input(v: number) { app.pick(v) } ],
+
+        tally: Text [ fontSize = 13, text = { app.completed == 1 ? "1 session finished" : app.completed + " sessions finished" },
+            textColor = { provided("theme").textMuted } ]
+        ]
+    ]

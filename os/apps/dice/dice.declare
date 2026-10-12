@@ -1,0 +1,121 @@
+/*
+# Dice — big dice, big numbers
+
+The dice are one record each in a `Dataset`; the tray makes a `Die` per record.
+A roll bumps `rollId`, which every die reads as its spin target, so a
+`Spring` turns each die exactly once and lets it settle. Faces scramble a few
+times by `afterDelay` before they land.
+*/
+
+script {
+    // pip positions on a 3x3 grid, by grid index
+    const PIPS: Record<number, number[]> = {
+        1: [4], 2: [0, 8], 3: [0, 4, 8], 4: [0, 2, 6, 8],
+        5: [0, 2, 4, 6, 8], 6: [0, 2, 3, 5, 6, 8]
+        }
+    function throwFaces(n: number, sides: number): object[] {
+        const out = []
+        for (let i = 0; i < n; i++) out.push({ "face": 1 + Math.floor(Math.random() * sides) })
+        return out
+        }
+    }
+
+App [ appName = "Dice",
+    night: boolean = { hostProvided("dark", app.dark) },
+    theme = { app.night ? CupertinoDark : Cupertino },
+    fill = { provided("theme").background },
+
+    count: number = 2,
+    sides: number = 6,
+    rollId: number = 0,
+    rolling: boolean = false,
+
+    dice: Dataset { { "items": [ { "face": 3 }, { "face": 5 } ] } },
+    faces: number[] = { ((app.dice.value?.items ?? []) as { face?: number }[]).map((r) => r.face ?? 0) },
+    total: number = { app.faces.reduce((a, b) => a + b, 0) },
+
+    roll() {
+        app.rollId = app.rollId + 1
+        const id = app.rollId
+        app.rolling = true
+        let n = 0
+        const step = () => {
+            if (id != app.rollId) return
+            n = n + 1
+            if (n > 6) { app.dice.set(["items"], throwFaces(app.count, app.sides)); app.rolling = false; return }
+            app.dice.set(["items"], throwFaces(app.count, app.sides))
+            afterDelay(70, step)
+            }
+        step()
+        },
+    setCount(n: number) { app.count = n; app.roll() },
+    setSides(n: number) { app.sides = n; app.roll() },
+
+    stage: View [ width = 100%, height = 100%, padding = 20,
+        layout: SimpleLayout [ axis = y, spacing = 14, align = center ],
+
+        readout: View [ layout: SimpleLayout [ axis = y, spacing = 2, align = center ],
+            sum: Text [ fontSize = 44, fontWeight = bold, text = { "" + app.total },
+                textColor = { provided("theme").text } ],
+            caption: Text [ fontSize = 13, text = { app.sides + "-sided dice × " + app.count },
+                textColor = { provided("theme").textMuted } ]
+            ],
+
+        tray: View [ width = 100%, height = { Math.max(120, parent.height - 210) },
+            edge: number = { Math.max(56, Math.min(this.height - 8, (this.width - 16) / (app.count + 0.5), 150)) },
+            layout: WrappingLayout [ spacing = 16, rowSpacing = 16, align = center ],
+            onClick() { app.roll() },
+            Die [ datapath = :items[], face = :face, sides = { app.sides },
+                edge = { parent.edge }, spin = { app.rollId } ]
+            ],
+
+        controls: View [ layout: SimpleLayout [ axis = y, spacing = 10, align = center ],
+            Button [ label = { app.rolling ? "Rolling…" : "Roll" }, primary = true,
+                disabled = { app.rolling }, onClick() { app.roll() } ],
+            howMany: Segmented [ width = 150, height = 30, choices = [ 1, 2, 3, 4 ],
+                value = { app.count }, disabled = { app.rolling },
+                input(v: number) { app.setCount(v) } ],
+            howManySides: Segmented [ width = 230, height = 30, choices = [ 4, 6, 8, 12, 20 ],
+                value = { app.sides }, disabled = { app.rolling },
+                input(v: number) { app.setSides(v) } ]
+            ]
+        ]
+    ]
+
+class Die extends View [
+    face: number = 1,
+    sides: number = 6,
+    edge: number = 90,
+    spin: number = 0,
+    angle: number = 0,
+    turn: Spring [ attribute = angle, to = { classroot.spin * Math.PI * 2 }, stiffness = 180, damping = 22 ],
+
+    width = { this.edge }, height = { this.edge },
+    rotation = { this.angle },
+
+    draw(d: Draw) {
+        const e = this.edge
+        d.save()
+        d.shadowColor = "rgba(0,0,0,0.30)"; d.shadowBlur = e * 0.14; d.shadowOffsetY = e * 0.05
+        d.fillStyle = app.night ? "#F2F2F7" : "#FFFFFF"
+        d.roundRect(0, 0, e, e, e * 0.19); d.fill()
+        d.restore()
+        d.strokeStyle = app.night ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.12)"
+        d.lineWidth = 1
+        d.roundRect(0.5, 0.5, e - 1, e - 1, e * 0.19); d.stroke()
+        const ink = this.sides == 6 ? "#1C1C1E" : "#D93A2B"
+        if (this.sides == 6) {
+            d.fillStyle = ink
+            for (const g of (PIPS[this.face] ?? [])) {
+                d.beginPath()
+                d.arc(e * (0.27 + 0.23 * (g % 3)), e * (0.27 + 0.23 * Math.floor(g / 3)), e * 0.085, 0, Math.PI * 2)
+                d.fill()
+                }
+            } else {
+            d.fillStyle = ink
+            d.font = "bold " + Math.round(e * 0.42) + "px system-ui"
+            d.textAlign = "center"; d.textBaseline = "middle"
+            d.fillText("" + this.face, e / 2, e / 2 + e * 0.02)
+            }
+        }
+    ]

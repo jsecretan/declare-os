@@ -1,0 +1,335 @@
+/*
+# The OS model — apps, windows, launching
+
+Faceless nodes only: nothing in this file draws. The desktop's views
+(desktop.declare, system/windows.declare, system/dock.declare) bind to what
+lives here.
+
+- **Apps are records**, read from `apps.json` (the registry). One record per
+  app the OS offers: identity, icon (a glyph on a two-hue plate), and what
+  launching it does (`kind`). Adding an app is one record plus, for a
+  `program` app, one program file under `apps/<id>/`.
+- **Windows are records** too (`WinManager.list`): one per open window, in
+  paint order. A raise is a `move`, an open an `insert`, a close a
+  `removeAt`; the desktop replicates one Window view per record.
+- **The Launcher** turns an app record into a window: the launch bounce,
+  spawn positions, and the zoom-out-of-the-icon origin.
+*/
+
+// an app's registry record — every field the OS reads; extra keys pass
+schema AppRec [
+    id: string,
+    label: string,                           // the dock pill's short name
+    title: string,                           // the formal name — menus, About
+    kind: "program" | "jots" | "assistant",  // what launching it does
+    program?: string,                        // kind "program": the app's program, relative to os/ ("apps/clock/clock")
+    glyph?: string,                          // the icon's mark — an emoji or a few letters
+    hue1?: string,                           // the icon plate's gradient, top → bottom ("#RRGGBB")
+    hue2?: string,
+    ink?: string,                            // the glyph's color (default white)
+    blurb?: string,                          // the About box's line
+    width?: number,                          // the window's opening size
+    height?: number
+    ]
+
+script {
+    // "#RRGGBB" → a Color number; a bad or missing value falls to `dflt`
+    function hex(s: string | undefined, dflt: number): number {
+        if (s == null || s.length < 7 || s[0] != "#") return dflt
+        const n = parseInt(s.slice(1, 7), 16)
+        return isNaN(n) ? dflt : n
+    }
+}
+
+
+/*
+## WinManager — the set of windows, as data
+
+Who is front, who is parked in the dock. Each record is
+{ id, cls, appId, mini, props… }; record order is paint order.
+*/
+
+class WinManager extends Node [
+    frontId: string = "",
+    frontWin: Window = { this.winOf(this.frontId) },
+
+    idSeq: number = 0,                           // mints record identity
+    winCount: number = 0,                        // staggers spawn positions
+
+    list: Dataset { { "wins": [] } },
+
+    recs() -> array { return (this.list.read(["wins"]) as object[]) ?? [] },
+    minis() -> array { return this.recs().filter((r) => r.mini == true) },
+    miniCount: number = { this.minis().length },
+    miniData: Dataset [ contents = { { minis: app.wm.minis() } } ],
+
+    activeAppId: string = { app.wm.frontWin != null ? app.wm.frontWin.appId : "" },
+
+    // ── the live windows (order = record order) ──
+
+    windows() -> Window[] { return app.wins.childViews as Window[] },
+    miniList() -> Window[] { return this.windows().filter((w) => this.isMin(w)).sort((a, b) => this.ixOf(a) - this.ixOf(b)) },
+    winOf(id: string) -> Window { return this.windows().find((w) => w.recId == id) ?? null },
+    idxOf(id: string) -> number { return this.recs().findIndex((r) => r.id == id) },
+
+    // ── the record verbs ──
+
+    spawn() -> number { winCount = winCount + 1; return winCount },
+    mintId() -> string { idSeq = idSeq + 1; return "w" + idSeq },
+
+    // an open inserts before the minimized tail — top of the normal band
+    addWin(rec: object) {
+        const ws = this.recs()
+        let at = ws.length
+        for (let i = 0; i < ws.length; i++) if (ws[i].mini == true) { at = i; break }
+        this.list.insert(["wins"], at, rec)
+        },
+
+    focusNew(id: string) { this.frontId = id },
+
+    // a raise is a move to the top of the normal band
+    raiseWin(w: Window) {
+        if (w == null || w.recId == "" || this.isMin(w)) return
+        const ws = this.recs()
+        const from = ws.findIndex((r) => r.id == w.recId)
+        if (from < 0) return
+        const rest = ws.filter((r) => r.id != w.recId)
+        let to = rest.length
+        for (let i = 0; i < rest.length; i++) if (rest[i].mini == true) { to = i; break }
+        this.list.move(["wins"], from, to)
+        },
+    patchWin(id: string, p: object) {
+        const i = this.idxOf(id)
+        if (i < 0) return
+        const ws = this.recs()
+        this.list.set(["wins", i], ({ ...(ws[i] as object), ...(p as object) }))
+        },
+    removeWin(id: string) {
+        const i = this.idxOf(id)
+        if (i >= 0) this.list.removeAt(["wins"], i)
+        },
+
+    focusWin(w: Window?) { if (w == null) return; if (this.isMin(w)) this.restoreMini(w); else w.activate() },
+
+    // Quit closes every window of that app and clears its running flag
+    quitApp(id: string) {
+        const doomed = this.windows().filter((w) => w.appId == id)
+        for (const w of doomed) this.closeWin(w)
+        app.launcher.setRunning(id, false)
+        },
+
+    // a dock press: raise the app's windows, else restore its newest
+    // minimized one, else launch it
+    dockOpen(id: string, open: () -> void) {
+        app.dockDismiss()
+        const live = this.windows().filter((w) => w.appId == id && !w.plain && !this.isMin(w))
+        if (live.length > 0) { for (const w of live) this.focusWin(w); return }
+        const mins = this.miniList().filter((w) => w.appId == id)
+        if (mins.length > 0) { this.restoreMini(mins[mins.length - 1]); return }
+        open()
+        },
+
+    // ── minimize to dock: the record's `mini` flag is membership; the
+    // journey (miniT, dockSlot, homing) is the window's own ──
+
+    isMin(w: Window?) -> boolean { return w != null && w.dockSlot >= 0 },
+    ixOf(w: Window?) -> number { return w != null ? w.dockSlot : -1 },
+    labelFor(w: Window) -> string { return w.title != "" ? w.title : app.launcher.titleOf(w.appId) },
+
+    startPark(w: Window) { w.miniBack.stop(); w.bornX = 0; w.bornY = 0; w.miniGo.start() },
+    startUnpark(w: Window) { w.miniGo.stop(); w.miniBack.start() },
+
+    minimizeWin(w: Window) {
+        if (w == null || w.plain || this.isMin(w)) return
+        this.patchWin(w.recId, ({ mini: true, label: this.labelFor(w), winW: w.width, winH: w.height }))
+        const from = this.idxOf(w.recId)
+        if (from >= 0) this.list.move(["wins"], from, this.recs().length - 1)
+        if (frontId == w.recId) frontId = ""
+        this.startPark(w)
+        },
+
+    restoreMini(w: Window) {
+        if (w == null || !this.isMin(w) || w.homing) return
+        w.homing = true
+        this.startUnpark(w)
+        w.activate()
+        },
+
+    // miniBack's onStop: the window is home
+    unparked(w: Window) {
+        this.patchWin(w.recId, ({ mini: false }))
+        const from = this.idxOf(w.recId)
+        const rest = this.recs().filter((r) => r.id != w.recId)
+        let to = rest.length
+        for (let i = 0; i < rest.length; i++) if (rest[i].mini == true) { to = i; break }
+        if (from >= 0) this.list.move(["wins"], from, to)
+        w.homing = false
+        this.focusWin(w)
+        },
+
+    restoreMiniAt(i: number) {
+        app.dockDismiss()
+        const ws = this.miniList()
+        if (i >= 0 && i < ws.length) this.restoreMini(ws[i])
+        },
+    closeWin(w: Window) { w.beginClose() },              // the reverse zoom; removal on its onStop
+
+    reallyClose(w: Window) {
+        if (frontId == w.recId) frontId = ""
+        this.removeWin(w.recId)
+        },
+
+    // a parked window is seated when its visual width equals its slot's
+    seated(id: string, slotW: number) -> boolean {
+        const w = this.winOf(id)
+        if (w == null || w.homing == true) return false
+        return w.scale < 0.9 && Math.abs(w.scale * w.width - slotW) < 0.5
+        }
+    ]
+
+
+/*
+## Launcher — getting apps born
+
+The registry (`apps.json`), which apps are running, and the open verbs behind
+every dock click and menu item.
+*/
+
+class Launcher extends Node [
+
+    // the registry: fetched from apps.json beside desktop.declare (the shell
+    // provides `base`, the OS folder in its own URL space; `rev` busts the
+    // cache whenever the agent changes the OS)
+
+    registry: DataSource [ auto = true, schema = [ apps[]: AppRec ],
+        url = { hostProvided("base", "") + "apps.json?rev=" + hostProvided("rev", 0) } ],
+    apps: AppRec[] = { this.registry.value?.apps ?? [] },
+
+    byId(id: string) -> AppRec { return this.apps.find((a) => a.id == id) ?? null },
+    titleOf(id: string) -> string { const a = this.byId(id); return a != null ? a.title : "" },
+
+    // which apps are running — a fact on the launcher, not on the records
+    // (the registry is the agent's file; this is the session's state)
+
+    running: string[] = [],
+    launching: string[] = [],
+    setRunning(id: string, on: boolean) {
+        const rest = this.running.filter((r) => r != id)
+        this.running = on ? [...rest, id] : rest
+        },
+
+    // the dock's rows: identity plus the running flag, in registry order
+    dockData: Dataset [ contents = { { apps: classroot.apps.map((a) => ({ id: a.id, running: classroot.running.includes(a.id) })) } } ],
+
+    // The launch gate: a first open bounces the dock icon and the window
+    // appears mid-second-bounce; later opens are instant.
+    gated(id: string, body: () -> void) {
+        const first = !this.running.includes(id) && !this.launching.includes(id)
+        if (first) this.launching = [...this.launching, id]
+        const go = () => {
+            this.launching = this.launching.filter((r) => r != id)
+            this.setRunning(id, true)
+            body()
+            }
+        if (first) { app.dock.poke(id); afterDelay(900, go) } else go()
+        },
+
+    // what a dock click or File → New does, by the record's kind
+    launch(id: string, v: View?) {
+        const a = this.byId(id)
+        if (a == null) return
+        if (a.kind == "assistant") { app.askAssistant(""); return }
+        if (a.kind == "jots") { this.newJot("", v); return }
+        if (a.kind == "program") this.openProgram(a, v)
+        },
+
+    // the origin view is a side channel: a node reference never enters data
+    borns: object,
+    onInit() { this.borns = ({}) },
+    putBorn(id: string, v: View?) { if (v != null && this.borns != null) this.borns[id] = v },
+    takeBorn(id: string) -> View {
+        if (this.borns == null) return null
+        const v = this.borns[id] ?? null
+        delete this.borns[id]
+        return v as View
+        },
+
+    openWin(id: string, cls: string, appId: string, props: object, v: View?) {
+        this.putBorn(id, v)
+        app.wm.addWin(({ id: id, cls: cls, appId: appId, mini: false, props: props }))
+        app.wm.focusNew(id)
+        },
+
+    // a view's center in app coordinates, scroll offsets included
+    originOf(v: View?) -> object {
+        if (v == null) return null
+        let ox = v.width / 2
+        let oy = v.height / 2
+        let n = v
+        while (n != null) {
+            ox += n.x || 0
+            oy += n.y || 0
+            const p = n.parent
+            if (p != null) { ox -= p.scrollX || 0; oy -= p.scrollY || 0 }
+            n = p
+            }
+        return ({ x: ox, y: oy })
+        },
+
+    openAbout(id: string) {
+        const n = app.wm.spawn()
+        this.openWin(app.wm.mintId(), "AboutWindow", id,
+            ({ wx: (app.width - 280) / 2 + (n % 3) * 16, wy: 110 + (n % 3) * 14 }), null)
+        },
+
+    // About boxes are modal in spirit: activating anything else dismisses them
+    dismissAbouts() {
+        const doomed = app.wm.windows().filter((w) => w.plain)
+        for (const w of doomed) app.wm.closeWin(w)
+        },
+
+    // a program app in a window: the AppWindow's island mounts it
+    openProgram(a: AppRec, v: View?) {
+        this.gated(a.id, () => {
+            this.dismissAbouts()
+            const n = app.wm.spawn()
+            const ww = Math.min(a.width ?? 640, app.width - 40)
+            const wh = Math.min(a.height ?? 460, app.height - app.menuBarH - 150)
+            const wx = Math.max(10, Math.round((app.width - ww) / 2) - 120 + (n % 6) * 40)
+            const wy = 24 + (n % 6) * 26
+            const o = this.originOf(v)
+            this.openWin(app.wm.mintId(), "AppWindow", a.id,
+                ({ program: "" + (a.program ?? ""), width: ww, height: wh, wx: wx, wy: wy,
+                    bornX: o != null ? o.x - wx : -1, bornY: o != null ? o.y - wy - app.menuBarH : -1 }), v)
+            })
+        },
+
+    // ── Jots: notes that are windows of the OS itself ──
+
+    welcomeNote: string = """
+**Welcome to Declare OS.** Everything you see — windows, dock, menus, this note — is a Declare program, and so is every app.
+
+**Make it yours.** Press **⌘J** (or Ctrl+J), or click the ✦ in the dock, and ask the assistant for something:
+
+- *"Make me a pomodoro timer app"*
+- *"Make the dock icons bigger"*
+- *"Add a sticky note that shows today's date"*
+
+It edits the OS's own source, checks it compiles, and reloads it live. If something breaks, **Undo** in the assistant panel puts it back.
+""",
+    newJot(txt: string, v: View?) {
+        this.gated("jots", () => {
+            this.dismissAbouts()
+            const n = app.wm.spawn()
+            this.openWin(app.wm.mintId(), "JotWindow", "jots",
+                ({ note: "" + (txt || "*A new note.*"),
+                    wx: 480 + (n % 5) * 26, wy: 90 + (n % 5) * 24 }), null)
+            })
+        },
+    openWelcome() {
+        this.setRunning("jots", true)
+        this.openWin(app.wm.mintId(), "JotWindow", "jots",
+            ({ note: this.welcomeNote,
+                width: 400, height: 360, wx: Math.max(440, app.width - 490), wy: 90 }), null)
+        }
+    ]

@@ -1,0 +1,65 @@
+/*
+# To-Do — a list that remembers
+
+The pattern for an app that keeps data between sessions:
+
+- `todos` is the one source of truth, an ordinary Dataset the views bind to.
+- `loader` reads the saved copy from the OS store once, at start, and hands it
+  to `todos`.
+- every edit goes to `todos`, then `save()` writes the whole thing back with
+  `saver` (a PUT). `hostProvided("store", …)` is this app's folder in the
+  store — the OS provides it; the fallback is used when run on its own.
+*/
+
+schema Todo [ id: number, title: string, done: boolean ]
+
+class TodoRow [ width = 100%, height = 36,
+    layout: SimpleLayout [ axis = x, spacing = 10, align = center ],
+    Checkbox [ checked = :done, input(v: boolean) { :done = v; app.save() } ],
+    Text [ width = { parent.width - 90 }, wrap = false, text = :title,
+        textColor = { :done ? provided("theme").textFaint : provided("theme").text } ],
+    Button [ label = "✕", onClick() { app.remove(rowIndex) } ]
+    ]
+
+App [ appName = "To-Do",
+    theme = { hostProvided("dark", app.dark) ? CupertinoDark : Cupertino },
+    fill = { provided("theme").background },
+
+    storeUrl: string = { hostProvided("store", "/api/store/todo/") + "items" },
+
+    todos: Dataset [ schema = [ items[]: Todo ] ] { { "items": [] } },
+    nextId: number = 1,
+    open: number = { (app.todos.value?.items ?? []).filter((t) => !t.done).length },
+
+    // nothing saved yet: the store answers null, the schema refuses it, and
+    // the load simply fails — the list starts empty
+    loader: DataSource [ url = { app.storeUrl }, auto = true, schema = [ items[]: Todo ],
+        onLoad() {
+            const items = this.value?.items ?? []
+            app.todos.set(["items"], items)
+            app.nextId = 1 + items.reduce((m, t) => Math.max(m, t.id), 0)
+            }
+        ],
+    saver: DataSource [ url = { app.storeUrl }, method = "PUT" ],
+    save() { app.saver.body = app.todos.value; app.saver.fetch() },
+
+    add(title: string) {
+        if (title.trim() == "") return
+        app.todos.set("/items/-", ({ id: app.nextId, title: title.trim(), done: false }))
+        app.nextId = app.nextId + 1
+        app.save()
+        },
+    remove(i: number) { app.todos.removeAt(["items"], i); app.save() },
+
+    col: View [ width = 100%, height = 100%, padding = 16,
+        layout: SimpleLayout [ axis = y, spacing = 12 ],
+        Text [ fontSize = 20, fontWeight = bold, text = { app.open == 1 ? "1 thing to do" : app.open + " things to do" } ],
+        entry: TextInput [ width = 100%, placeholder = "Add a to-do and press Return",
+            onEnter() { app.add(this.text); this.text = "" } ],
+        list: View [ width = 100%, height = { parent.height - 110 }, scrolls = y,
+            datapath = { app.todos.value },
+            layout: SimpleLayout [ axis = y, spacing = 2 ],
+            TodoRow [ datapath = :items[] ]
+            ]
+        ]
+    ]

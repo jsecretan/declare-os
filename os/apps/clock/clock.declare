@@ -1,0 +1,30 @@
+/*
+# Clock — a digital clock
+
+A `Time` at second resolution drives the readout; the digits update by
+constraint, never by a timer.
+*/
+
+App [ appName = "Clock",
+    night: boolean = { hostProvided("dark", app.dark) },
+    fill = { app.night ? 0x1C1C1E : 0xF2F2F7 },
+    t: Time [ tick = second ],
+
+    readout: Text [ x = center, y = center,
+        fontSize = { Math.max(28, Math.min(parent.width / 5.5, 80)) },
+        fontWeight = bold,
+        textColor = { app.night ? 0xF2F2F7 : 0x1C1C1E },
+        text = { pad(app.t.hour % 12 == 0 ? 12 : app.t.hour % 12) + ":" +
+                 pad(app.t.minute) + ":" + pad(app.t.second) } ],
+
+    meridiem: Text [ x = center, y = { app.readout.y + app.readout.height + 10 },
+        fontSize = 18, fontWeight = medium,
+        textColor = { app.night ? 0x98989D : 0x6E6E73 },
+        text = { (app.t.hour >= 12 ? "PM" : "AM") + "  ·  " + MONTHS[app.t.month - 1] + " " + app.t.day + ", " + app.t.year } ]
+    ]
+
+script {
+    const MONTHS = ["January", "February", "March", "April", "May", "June",
+                    "July", "August", "September", "October", "November", "December"]
+    function pad(n: number): string { return (n < 10 ? "0" : "") + n }
+}

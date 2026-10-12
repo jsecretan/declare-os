@@ -1,0 +1,116 @@
+{
+  "apps": [
+    {
+      "id": "assistant",
+      "label": "Assistant",
+      "title": "Assistant",
+      "kind": "assistant",
+      "glyph": "✦",
+      "hue1": "#7B5CFF",
+      "hue2": "#3A1FB8",
+      "blurb": "Asks the local agent to change this OS — its apps, its look, its behavior."
+    },
+    {
+      "id": "jots",
+      "label": "Jots",
+      "title": "Jots",
+      "kind": "jots",
+      "glyph": "✎",
+      "hue1": "#FCF4A7",
+      "hue2": "#F3E27E",
+      "ink": "#8A7300",
+      "blurb": "Small paper notes with their own window chrome."
+    },
+    {
+      "id": "dice",
+      "label": "Dice",
+      "title": "Dice",
+      "kind": "program",
+      "program": "apps/dice/dice",
+      "width": 380,
+      "height": 460,
+      "glyph": "\u2680",
+      "hue1": "#FFD60A",
+      "hue2": "#D9A21B",
+      "blurb": "Big dice to throw \u2014 d4 through d20, with a running total."
+    },
+    {
+      "id": "calculator",
+      "label": "Calculator",
+      "title": "Calculator",
+      "kind": "program",
+      "program": "apps/calculator/calculator",
+      "width": 300,
+      "height": 440,
+      "glyph": "±",
+      "hue1": "#FF9F0A",
+      "hue2": "#D9680A",
+      "blurb": "A four-function calculator."
+    },
+    {
+      "id": "clock",
+      "label": "Clock",
+      "title": "Clock",
+      "kind": "program",
+      "program": "apps/clock/clock",
+      "width": 320,
+      "height": 380,
+      "glyph": "◷",
+      "hue1": "#3A3D44",
+      "hue2": "#16171B",
+      "blurb": "An analog clock with a sweeping second hand."
+    },
+    {
+      "id": "pomodoro",
+      "label": "Pomodoro",
+      "title": "Pomodoro Timer",
+      "kind": "program",
+      "program": "apps/pomodoro/pomodoro",
+      "width": 320,
+      "height": 460,
+      "glyph": "\ud83c\udf45",
+      "hue1": "#FF9F0A",
+      "hue2": "#D93A2B",
+      "blurb": "A 25-minute focus timer that remembers your sessions."
+    },
+    {
+      "id": "invaders",
+      "label": "Invaders",
+      "title": "Space Invaders",
+      "kind": "program",
+      "program": "apps/invaders/invaders",
+      "width": 460,
+      "height": 520,
+      "glyph": "\ud83d\udc7e",
+      "hue1": "#4FD8A6",
+      "hue2": "#1E7A5E",
+      "blurb": "A tiny space invaders game."
+    },
+    {
+      "id": "todo",
+      "label": "To-Do",
+      "title": "To-Do",
+      "kind": "program",
+      "program": "apps/todo/todo",
+      "width": 380,
+      "height": 480,
+      "glyph": "✓",
+      "hue1": "#34C759",
+      "hue2": "#1E8E3E",
+      "blurb": "A to-do list that remembers between sessions."
+    },
+    {
+      "id": "writer",
+      "label": "Word Processor",
+      "title": "Word Processor",
+      "kind": "program",
+      "program": "apps/writer/writer",
+      "width": 620,
+      "height": 560,
+      "glyph": "\u00b6",
+      "hue1": "#5AC8FA",
+      "hue2": "#2A6FD0",
+      "blurb": "A single autosaving document with a word count."
+    }
+  ]
+}

@@ -1,0 +1,315 @@
+/*
+# Declare OS — the shell
+
+The one program the agent never edits. It hosts the OS (os/desktop.declare)
+in an island that fills the page, and floats the assistant panel above it.
+
+- **The conversation** arrives over one `EventStream` (/api/events) as small
+  operations — reset, push a block, append text to one, patch one, state —
+  which `apply` writes into the `chat` dataset the panel replicates.
+- **A prompt** is one POST (/api/prompt); the reply streams in on the events.
+- **A change** to the OS bumps `rev`, and the page reloads: every program is
+  then fetched and compiled fresh from disk, and the conversation replays from
+  the bridge. Whether the panel is open is the page's location (`#chat`), so
+  it comes back as it was. A change that broke the desktop doesn't bump `rev`,
+  so the last good OS keeps running; the panel says so, and Undo puts it back.
+*/
+
+script {
+    // the one host call the shell needs: a fresh load of everything
+    function reloadPage(): void { location.reload() }
+}
+
+schema ChatItem [ id: string, kind: string, text: string, name?: string, status?: string, output?: string ]
+
+
+/*
+## Transcript blocks — one class per kind, picked by `classFor`
+*/
+
+class Block [ width = 100% ]
+
+class UserBlock extends Block [
+    bubble: View [ x = end, cornerRadius = 14, padding = [8, 12, 8, 12], fill = #0A84FF,
+        width = { Math.min(parent.width * 0.85, this.t.width + 24) },
+        t: Text [ wrap = true, fontSize = 13.5, textColor = #FFFFFF,
+            width = { Math.min(classroot.width * 0.85 - 24, this.contentWidth) },
+            text = :text ]
+        ]
+    ]
+
+class AssistantBlock extends Block [
+    md: Markdown [ width = 100%, fontSize = 13.5, lineHeight = 1.5,
+        bodyColor = #E5E5EA, headingColor = #FFFFFF, linkColor = #64D2FF,
+        codeBackground = #2C2C30, codeRule = #7B5CFF,
+        text = :text ]
+    ]
+
+// the model's reasoning: a short window onto its latest lines while it
+// streams (and after), the whole of it on a click. It never shrinks by itself:
+// the log follows its end, and content shrinking under it would undo that.
+class ThinkingBlock extends Block [
+    open: boolean = false,
+    live: boolean = { :status != "done" },
+    cap: number = 68,
+    layout: SimpleLayout [ axis = y, spacing = 4 ],
+    head: View [ height = 20, cursor = "pointer",
+        onClick() { classroot.open = !classroot.open },
+        layout: SimpleLayout [ axis = x, spacing = 6, align = center ],
+        Text [ fontSize = 11, textColor = #8E8E93, text = { classroot.open ? "▾" : "▸" } ],
+        Text [ fontSize = 12, fontWeight = medium, textColor = #98989D,
+            text = { classroot.live ? "Thinking…" : classroot.body.t.height > classroot.cap && !classroot.open ? "Thought · show all" : "Thought" } ]
+        ],
+    body: View [ width = 100%, clip = true, cursor = "pointer",
+        height = { classroot.open ? classroot.body.t.height : Math.min(classroot.body.t.height, classroot.cap) },
+        onClick() { classroot.open = !classroot.open },
+        t: Text [ width = 100%, wrap = true, fontSize = 12, italic = true, textColor = #8E8E93,
+            y = { classroot.open ? 0 : Math.min(0, classroot.cap - this.height) },   // the tail shows
+            text = { "" + :text } ]
+        ]
+    ]
+
+// something the agent did, told in the user's terms ("Changing the Clock app")
+class ToolBlock extends Block [ height = 22,
+    mark: Text [ x = 2, y = center, fontSize = 12, fontWeight = bold,
+        textColor = { :status == "ok" ? 0x30D158 : :status == "error" ? 0xFF9F0A : 0xFFD60A },
+        text = { :status == "ok" ? "✓" : :status == "error" ? "!" : "●" } ],
+    what: Text [ x = 20, y = center, fontSize = 12.5, wrap = false, clip = true,
+        width = { parent.width - this.x },
+        textColor = { :status == "running" ? 0xE5E5EA : 0xAEAEB2 },
+        text = { "" + :text + (:status == "running" ? "…" : "") } ]
+    ]
+
+class SystemBlock extends Block [
+    t: Text [ x = center, width = { Math.min(this.contentWidth, parent.width - 20) }, wrap = true,
+        textAlign = center, fontSize = 11.5, textColor = #98989D, text = :text ]
+    ]
+
+
+// a suggestion on the empty panel: press it to send it
+class Suggestion extends Control [ width = 100%, height = 34, cornerRadius = 9,
+    label: string = "",
+    fill = { this.hovered ? 0xFFFFFF1F : 0xFFFFFF12 },
+    press() { app.send(this.label) },
+    t: Text [ x = 12, y = center, fontSize = 13, textColor = #E5E5EA, text = { classroot.label } ]
+    ]
+
+
+// a small text button in the panel's header
+class HeadButton extends Control [ height = 24, cornerRadius = 6,
+    label: string = "",
+    width = { this.t.width + 16 },
+    fill = { this.hovered && !this.disabled ? 0xFFFFFF1F : 0xFFFFFF00 },
+    opacity = { this.disabled ? 0.35 : 1 },
+    tooltipLabel = "",
+    act() { },
+    press() { this.act() },
+    t: Text [ x = 8, y = center, fontSize = 12, fontWeight = medium, textColor = #E5E5EA, text = { classroot.label } ]
+    ]
+
+
+App [ appName = "Declare OS", scrolls = none, fill = #000000,
+    fontFamily = "system-ui, sans-serif",
+    theme = CupertinoDark,
+
+    // ── what the bridge reports ──
+
+    rev: number = 0,                             // 0 until the first state arrives
+    busy: boolean = false,
+    broken: string = "",                         // the desktop's verifier output when a change broke it
+    model: string = "unknown",
+    canUndo: boolean = false,
+    connected: boolean = { app.events.status == "open" },
+
+    chat: Dataset [ schema = [ blocks[]: ChatItem ] ] { { "blocks": [] } },
+    empty: boolean = { (app.chat.value?.blocks ?? []).length == 0 },
+
+    events: EventStream [ url = "/api/events",
+        onMessage(e: StreamMessage) { app.apply(JSON.parse(e.data)) } ],
+
+    apply(m: object) {
+        if (m.op == "reset") app.chat.set(["blocks"], m.blocks)
+        else if (m.op == "push") app.chat.set("/blocks/-", m.block)
+        else if (m.op == "append") {
+            const cur = app.chat.value?.blocks[m.i]
+            if (cur != null) app.chat.set(["blocks", m.i, "text"], cur.text + m.text)
+            }
+        else if (m.op == "patch") { for (const k of Object.keys(m.fields)) app.chat.set(["blocks", m.i, k], m.fields[k]) }
+        else if (m.op == "state") {
+            app.busy = m.busy
+            app.broken = m.broken
+            app.model = m.model
+            app.canUndo = m.canUndo
+            if (app.rev != 0 && m.rev != app.rev) reloadPage()   // the OS changed under us
+            else app.rev = m.rev
+            }
+        if (m.op == "reset") { app.following = true; afterSettle(app.toEnd) }
+        },
+
+    // ── following the conversation ──
+    // The log keeps to its end as it grows (the stack's height changing is
+    // the cue), unless the reader has scrolled up to read; scrolling back
+    // down to the end picks them up again.
+    following: boolean = true,
+    lastY: number = 0,
+    noteScroll() {
+        const log = app.panel.log
+        if (log.scrollY >= log.stack.height + 28 - log.height - 60) app.following = true
+        else if (log.scrollY < app.lastY) app.following = false
+        app.lastY = log.scrollY
+        },
+    toEnd() { app.panel.log.scrollTo(Infinity) },
+
+    // ── the verbs, each one POST ──
+
+    prompter: DataSource [ url = "/api/prompt", method = "POST" ],
+    send(text: string) {
+        if (text.trim() == "" || app.busy) return
+        app.prompter.body = ({ text: text })
+        app.prompter.fetch()
+        app.following = true                   // sending always brings the end back into view
+        afterSettle(app.toEnd)
+        },
+    aborter: DataSource [ url = "/api/abort", method = "POST" ],
+    undoer: DataSource [ url = "/api/undo", method = "POST" ],
+    fresh: DataSource [ url = "/api/newchat", method = "POST" ],
+
+    // ── the panel's place ──
+
+    chatOpen: boolean = { app.location == "chat" },   // in the URL, so a reload keeps it
+    panelT: number = 0,
+    slide: Spring [ attribute = panelT, to = { app.chatOpen ? 1 : 0 }, stiffness = 260, damping = 28, epsilon = 0.001 ],
+    openChat(text: string) {
+        app.location = "chat"
+        if (text != "") app.panel.foot.input.text = text
+        afterSettle(app.focusInput)
+        },
+    focusInput() { Focus.focus(app.panel.foot.input) },
+
+    keys: Keys [
+        onKeyDown(e: KeyEvent) {
+            if ((e.meta || e.ctrl) && (e.key == "j" || e.key == "J") && !e.repeat) app.openChat("")
+            else if (e.key == "Escape" && app.chatOpen) app.location = ""
+            }
+        ],
+
+    // ── the OS, filling the page ──
+
+    os: AppIsland [ x = 0, y = 0, width = 100%, height = 100%,
+        // island names resolve from this folder's demos/; mounted once the
+        // bridge has said which revision this is
+        program = { app.rev == 0 ? "" : "../os/desktop" },
+        provides = ["base", "rev"],
+        base: string = "/os/",                   // absolute: a remounted tenant resolves relative URLs from elsewhere
+        rev: number = { app.rev },
+        onPost(m: IslandPost) {
+            if (m.topic == "assistant") app.openChat("" + ((m.payload as { text?: string })?.text ?? ""))
+            }
+        ],
+
+    // ── the broken-desktop notice, above the OS ──
+
+    notice: View [ visible = { app.broken != "" }, x = center, y = 44, width = 460,
+        cornerRadius = 12, padding = 14, fill = #3A1D1DF2, stroke = { stroke(1, 0xFF453A80) },
+        shadow = { shadow(0, 10, 30, 0x00000080) },
+        layout: SimpleLayout [ axis = y, spacing = 10 ],
+        Text [ width = 100%, wrap = true, fontSize = 13, fontWeight = semibold, textColor = #FFFFFF,
+            text = "The last change broke the desktop, so the previous version is still running." ],
+        Text [ width = 100%, wrap = true, fontSize = 11, textColor = #FFB4AE,
+            fontFamily = "ui-monospace, Menlo, monospace",
+            text = { app.broken.split("\n").slice(0, 6).join("\n") } ],
+        View [ layout: SimpleLayout [ axis = x, spacing = 8 ],
+            Button [ label = "Undo that change", primary = true, onClick() { app.undoer.fetch() } ],
+            Button [ label = "Ask the assistant to fix it",
+                onClick() { app.openChat("The desktop no longer compiles. Run `npx declare-verify desktop.declare` and fix every error.") } ]
+            ]
+        ],
+
+    // ── the assistant panel ──
+
+    panel: View [ width = 420, y = 40, height = { app.height - 52 },
+        x = { app.width - (this.width + 12) * app.panelT },
+        visible = { app.chatOpen || app.panelT > 0.001 },
+        opacity = { Math.min(1, app.panelT * 1.6) },
+        cornerRadius = 16, clip = true,
+        fill = #1C1C1EE0, backdrop = frost(24, 1.4),
+        stroke = { stroke(1, 0xFFFFFF1F) },
+        shadow = { shadow(0, 18, 50, 0x00000080) },
+
+        head: View [ x = 0, y = 0, width = 100%, height = 48,
+            badge: View [ x = 14, y = center, width = 26, height = 26, cornerRadius = 7,
+                fill = { gradient(0x7B5CFF, 0x3A1FB8) },
+                Text [ x = center, y = center, fontSize = 14, textColor = #FFFFFF, text = "✦" ] ],
+            title: Text [ x = 48, y = 7, fontSize = 14, fontWeight = semibold, textColor = #FFFFFF, text = "Assistant" ],
+            dot: View [ x = 48, y = 30, width = 7, height = 7, cornerRadius = 3.5,
+                fill = { !app.connected ? 0xFF453A : app.busy ? 0xFFD60A : app.model == "ready" ? 0x30D158 : app.model == "offline" ? 0xFF453A : app.model == "asleep" ? 0x8E8E93 : 0xFF9F0A } ],
+            status: Text [ x = 60, y = 26, fontSize = 11, textColor = #98989D,
+                text = { !app.connected ? "Connecting to the bridge…"
+                    : app.busy ? (app.model == "loading" ? "Waking the model (1–3 min)…" : "Working…")
+                    : app.model == "ready" ? "Ready · local qwen3.8-flash"
+                    : app.model == "offline" ? "Model offline — start Strata"
+                    : app.model == "asleep" ? "Model asleep — wakes on your first prompt (1–3 min)"
+                    : "Model loading…" } ],
+            tools: View [ x = { parent.width - this.width - 10 }, y = center,
+                layout: SimpleLayout [ axis = x, spacing = 2, align = center ],
+                HeadButton [ label = "Undo", tooltipLabel = "Revert the last change to the OS",
+                    disabled = { !app.canUndo || app.busy }, act() { app.undoer.fetch() } ],
+                HeadButton [ label = "New chat", tooltipLabel = "Start a fresh conversation",
+                    disabled = { app.busy }, act() { app.fresh.fetch() } ],
+                HeadButton [ label = "✕", act() { app.location = "" } ]
+                ]
+            ],
+        rule: View [ x = 0, y = 48, width = 100%, height = 1, fill = #FFFFFF1A ],
+
+        // the conversation — read from the bottom, so it follows new text
+        // while the reader is at the end and holds still when they scroll up
+        log: View [ x = 0, y = 49, width = 100%, height = { parent.height - 49 - 64 },
+            scrolls = y, scrollAnchor = none, padding = [14, 16, 14, 16],
+            trackChanges = ["scrollY"],
+            onChange() { app.noteScroll() },
+            stack: View [ width = 100%, datapath = { app.chat.value },
+                trackChanges = ["height"],
+                onChange() { if (app.following) app.toEnd() },
+                layout: SimpleLayout [ axis = y, spacing = 10 ],
+                Block [ datapath = :blocks[], key = :id,
+                    classFor = { :kind == "user" ? UserBlock : :kind == "assistant" ? AssistantBlock
+                        : :kind == "thinking" ? ThinkingBlock : :kind == "tool" ? ToolBlock : SystemBlock } ]
+                ]
+            ],
+
+        // shown while there is no conversation yet
+        hello: View [ visible = { app.empty }, x = 16, y = 70, width = { parent.width - 32 },
+            layout: SimpleLayout [ axis = y, spacing = 8 ],
+            Text [ width = 100%, wrap = true, fontSize = 13, textColor = #C7C7CC,
+                text = "Ask for a new app, or for any change to the OS — its dock, windows, menus or look. The agent edits the OS's Declare source, checks it, and reloads it." ],
+            View [ width = 4, height = 6 ],
+            Suggestion [ label = "Make a pomodoro timer app" ],
+            Suggestion [ label = "Make the dock icons smaller" ],
+            Suggestion [ label = "Add a dice-rolling app with big dice" ],
+            Suggestion [ label = "Show the date and seconds in the menu bar clock" ]
+            ],
+
+        foot: View [ x = 0, y = { parent.height - 64 }, width = 100%, height = 64,
+            Rule: View [ x = 0, y = 0, width = 100%, height = 1, fill = #FFFFFF1A ],
+            input: TextInput [ x = 14, y = 14, width = { parent.width - 28 - 76 }, height = 36,
+                textColor = #F2F2F7,
+                placeholder = { app.busy ? "Working — wait, or Stop" : "Ask for an app or a change…" },
+                onEnter() { if (!app.busy && this.text.trim() != "") { app.send(this.text); this.text = "" } } ],
+            go: Button [ x = { parent.width - 14 - 68 }, y = 18, width = 68,
+                label = { app.busy ? "Stop" : "Send" }, primary = { !app.busy },
+                onClick() {
+                    if (app.busy) app.aborter.fetch()
+                    else { const t = app.panel.foot.input.text; if (t.trim() != "") { app.send(t); app.panel.foot.input.text = "" } }
+                    } ]
+            ]
+        ],
+
+    // the way in when the OS can't offer one: a corner button, always there
+    fab: View [ visible = { !app.chatOpen }, x = { app.width - 52 }, y = { app.height - 52 },
+        width = 40, height = 40, cornerRadius = 20, opacity = { this.hovered ? 1 : 0.55 },
+        fill = { gradient(0x7B5CFF, 0x3A1FB8) }, shadow = { shadow(0, 4, 14, 0x00000066) },
+        cursor = "pointer", tooltipLabel = "Assistant (⌘J)",
+        onClick() { app.openChat("") },
+        Text [ x = center, y = center, fontSize = 18, textColor = #FFFFFF, text = "✦" ]
+        ]
+    ]
