@@ -1,23 +1,30 @@
 /*
-# Calculator — a four-function calculator
+# Calculator — a scientific calculator
 
 The keys are records (`pad`), replicated into a wrapping grid; each key is a
 `CalcKey` control whose press hands its record back to the App. The App holds
 the whole state: the display, the pending operator, and the stored operand.
+The grid is five keys wide, so every row of `pad` holds exactly five records.
+`2nd` latches the scientific keys onto their alternates (`label2`): sinh, x³,
+∛, eˣ. `DEG` latches between degrees and radians.
 */
 
-class CalcKey extends Control [ height = 58, cornerRadius = 29,
+class CalcKey extends Control [
     label: string = "",
-    kind: string = "num",                        // "num" | "fn" | "op"
+    alt: string = "",                            // label shown while 2nd is on
+    kind: string = "num",                        // "num" | "fn" | "op" | "sci"
     wide: boolean = false,
-    width = { this.wide ? 58 * 2 + 12 : 58 },
-    fill = { this.kind == "op" ? provided("theme").keyOp : this.kind == "fn" ? provided("theme").keyFn : provided("theme").key },
+    lit: boolean = false,                        // a latched key shows in the operator color
+    height = { app.keyEdge }, cornerRadius = { app.keyEdge / 2 },
+    width = { this.wide ? app.keyEdge * 2 + app.keyGap : app.keyEdge },
+    fill = { this.kind == "op" || this.lit ? provided("theme").keyOp : this.kind == "fn" || this.kind == "sci" ? provided("theme").keyFn : provided("theme").key },
     opacity = { this.pressed ? 0.7 : 1 },
     hit() { },
     press() { this.hit() },
-    t: Text [ x = { classroot.wide ? 22 : (classroot.width - this.width) / 2 }, y = center, fontSize = 24, fontWeight = medium,
-        textColor = { classroot.kind == "fn" ? provided("theme").textFn : provided("theme").text },
-        text = { classroot.label } ]
+    t: Text [ x = { classroot.wide ? 20 : (classroot.width - this.width) / 2 }, y = center,
+        fontSize = { classroot.kind == "sci" ? 17 : 22 }, fontWeight = medium,
+        textColor = { classroot.kind == "fn" || classroot.kind == "sci" || classroot.lit ? provided("theme").textFn : provided("theme").text },
+        text = { app.second && classroot.alt != "" ? classroot.alt : classroot.label } ]
     ]
 
 // the keys' colors are tokens on top of a full preset (the library's
@@ -25,22 +32,54 @@ class CalcKey extends Control [ height = 58, cornerRadius = 29,
 App [ appName = "Calculator",
     theme = { { ...CupertinoDark, surface: 0x1C1C1E, key: 0x333336, keyFn: 0xA5A5AA, keyOp: 0xFF9F0A, text: 0xFFFFFF, textFn: 0x1C1C1E } }, fill = { provided("theme").surface },
 
+    keyEdge: number = 52,                        // one key square
+    keyGap: number = 10,
+
     display: string = "0",
     stored: number = 0,
     op: string = "",                             // the pending operator, "" for none
     fresh: boolean = true,                       // the next digit starts a new number
+    second: boolean = false,                     // 2nd is on: sci keys show their alternates
+    deg: boolean = true,                         // trig works in degrees unless flipped to RAD
+    ans: number = 0,                             // the last result, for ANS
 
     pad: Dataset { { "keys": [
-        { "id": "c", "label": "C", "kind": "fn" }, { "id": "neg", "label": "±", "kind": "fn" },
-        { "id": "pct", "label": "%", "kind": "fn" }, { "id": "÷", "label": "÷", "kind": "op" },
+        { "id": "2nd", "label": "2nd", "label2": "2nd", "kind": "sci" },
+        { "id": "sin", "label": "sin", "label2": "sinh", "kind": "sci" },
+        { "id": "cos", "label": "cos", "label2": "cosh", "kind": "sci" },
+        { "id": "tan", "label": "tan", "label2": "tanh", "kind": "sci" },
+        { "id": "DEG", "label": "DEG", "kind": "sci" },
+
+        { "id": "ln", "label": "ln", "label2": "eˣ", "kind": "sci" },
+        { "id": "log", "label": "log", "label2": "10ˣ", "kind": "sci" },
+        { "id": "sq", "label": "x²", "label2": "x³", "kind": "sci" },
+        { "id": "sqrt", "label": "√x", "label2": "∛x", "kind": "sci" },
+        { "id": "inv", "label": "1/x", "kind": "sci" },
+
+        { "id": "xpowy", "label": "xʸ", "kind": "op" },
+        { "id": "ncr", "label": "nCr", "kind": "op" },
+        { "id": "npr", "label": "nPr", "kind": "op" },
+        { "id": "fact", "label": "n!", "kind": "sci" },
+        { "id": "mod", "label": "mod", "kind": "op" },
+
+        { "id": "c", "label": "C", "kind": "fn" }, { "id": "back", "label": "⌫", "kind": "fn" },
+        { "id": "neg", "label": "±", "kind": "fn" }, { "id": "pct", "label": "%", "kind": "fn" },
+        { "id": "÷", "label": "÷", "kind": "op" },
+
         { "id": "7", "label": "7", "kind": "num" }, { "id": "8", "label": "8", "kind": "num" },
-        { "id": "9", "label": "9", "kind": "num" }, { "id": "×", "label": "×", "kind": "op" },
+        { "id": "9", "label": "9", "kind": "num" }, { "id": "pi", "label": "π", "kind": "sci" },
+        { "id": "×", "label": "×", "kind": "op" },
+
         { "id": "4", "label": "4", "kind": "num" }, { "id": "5", "label": "5", "kind": "num" },
-        { "id": "6", "label": "6", "kind": "num" }, { "id": "−", "label": "−", "kind": "op" },
+        { "id": "6", "label": "6", "kind": "num" }, { "id": "e", "label": "e", "kind": "sci" },
+        { "id": "−", "label": "−", "kind": "op" },
+
         { "id": "1", "label": "1", "kind": "num" }, { "id": "2", "label": "2", "kind": "num" },
-        { "id": "3", "label": "3", "kind": "num" }, { "id": "+", "label": "+", "kind": "op" },
+        { "id": "3", "label": "3", "kind": "num" }, { "id": "abs", "label": "|x|", "kind": "sci" },
+        { "id": "+", "label": "+", "kind": "op" },
+
         { "id": "0", "label": "0", "kind": "num", "wide": true }, { "id": ".", "label": ".", "kind": "num" },
-        { "id": "=", "label": "=", "kind": "op" }
+        { "id": "=", "label": "=", "kind": "op" }, { "id": "ans", "label": "ANS", "kind": "sci" }
         ] } },
 
     apply(a: number, b: number, o: string) -> number {
@@ -48,7 +87,22 @@ App [ appName = "Calculator",
         if (o == "−") return a - b
         if (o == "×") return a * b
         if (o == "÷") return b == 0 ? NaN : a / b
+        if (o == "xʸ") return Math.pow(a, b)
+        if (o == "mod") return b == 0 ? NaN : a % b
+        if (o == "nCr") return this.comb(a, b)
+        if (o == "nPr") return this.fact(a) / this.fact(a - b)
         return b
+        },
+    toRad(x: number) -> number { return app.deg ? x * Math.PI / 180 : x },
+    fact(n: number) -> number {
+        if (n != Math.floor(n) || n < 0 || n > 170) return NaN
+        let r = 1
+        for (let i = 2; i <= n; i = i + 1) r = r * i
+        return r
+        },
+    comb(n: number, r: number) -> number {
+        if (r > n) return NaN
+        return this.fact(n) / (this.fact(r) * this.fact(n - r))
         },
     show(n: number) -> string {
         if (!isFinite(n)) return "Error"
@@ -62,10 +116,29 @@ App [ appName = "Calculator",
             if (fresh) { display = id == "." ? "0." : id; fresh = false }
             else if (!(id == "." && display.indexOf(".") >= 0) && display.length < 12) display = display == "0" && id != "." ? id : display + id
             }
-        else if (id == "c") { display = "0"; stored = 0; op = ""; fresh = true }
+        else if (id == "c") { display = "0"; stored = 0; op = ""; fresh = true; second = false }
+        else if (id == "back") {
+            if (fresh) display = "0"
+            else display = display.length <= 1 || (display.length == 2 && display.indexOf("-") == 0) ? "0" : display.slice(0, display.length - 1)
+            }
+        else if (id == "2nd") second = !second
+        else if (id == "DEG") deg = !deg
         else if (id == "neg") display = this.show(-cur)
         else if (id == "pct") display = this.show(cur / 100)
-        else if (id == "=") { display = this.show(this.apply(stored, cur, op)); op = ""; fresh = true }
+        else if (id == "sin") display = this.show(second ? Math.sinh(cur) : Math.sin(this.toRad(cur)))
+        else if (id == "cos") display = this.show(second ? Math.cosh(cur) : Math.cos(this.toRad(cur)))
+        else if (id == "tan") display = this.show(second ? Math.tanh(cur) : Math.tan(this.toRad(cur)))
+        else if (id == "ln") display = this.show(second ? Math.exp(cur) : Math.log(cur))
+        else if (id == "log") display = this.show(second ? Math.pow(10, cur) : Math.log10(cur))
+        else if (id == "sq") display = this.show(second ? cur * cur * cur : cur * cur)
+        else if (id == "sqrt") display = this.show(second ? Math.cbrt(cur) : Math.sqrt(cur))
+        else if (id == "inv") display = this.show(1 / cur)
+        else if (id == "fact") display = this.show(this.fact(cur))
+        else if (id == "abs") display = this.show(Math.abs(cur))
+        else if (id == "pi") { display = this.show(Math.PI); fresh = true }
+        else if (id == "e") { display = this.show(Math.E); fresh = true }
+        else if (id == "ans") { display = this.show(ans); fresh = true }
+        else if (id == "=") { ans = this.apply(stored, cur, op); display = this.show(ans); op = ""; fresh = true }
         else {
             stored = op != "" && !fresh ? this.apply(stored, cur, op) : cur
             display = this.show(stored)
@@ -74,13 +147,15 @@ App [ appName = "Calculator",
             }
         },
 
-    body: View [ x = center, y = end, width = { 58 * 4 + 12 * 3 }, padding = [0, 0, 18, 0],
-        layout: SimpleLayout [ axis = y, spacing = 14 ],
-        readout: Text [ x = end, fontSize = 52, fontWeight = light, textColor = { provided("theme").text },
+    body: View [ x = center, y = end, width = { app.keyEdge * 5 + app.keyGap * 4 }, padding = [0, 0, 16, 0],
+        layout: SimpleLayout [ axis = y, spacing = 12 ],
+        readout: Text [ x = end, width = 100%, fontSize = 40, fontWeight = light, textColor = { provided("theme").text },
             text = { app.display } ],
         grid: View [ width = 100%, datapath = { app.pad.value },
-            layout: WrappingLayout [ spacing = 12, rowSpacing = 12 ],
-            CalcKey [ datapath = :keys[], label = :label, kind = :kind, wide = { :wide == true },
+            layout: WrappingLayout [ spacing = { app.keyGap }, rowSpacing = { app.keyGap } ],
+            CalcKey [ datapath = :keys[], label = { "" + :id == "DEG" ? (app.deg ? "DEG" : "RAD") : :label },
+                alt = { "" + (:label2 == undefined ? "" : :label2) }, kind = :kind, wide = { :wide == true },
+                lit = { ("" + :id == "2nd" && app.second) || ("" + :id == "DEG" && !app.deg) },
                 hit() { app.key("" + :id) } ]
             ]
         ]

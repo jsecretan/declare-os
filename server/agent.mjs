@@ -11,6 +11,8 @@
 //   POST /api/undo              revert the last agent change
 //   POST /api/factory           restore the OS to its first commit
 //   POST /api/newchat           fresh agent session + empty transcript
+//   POST /api/chats/open {id}   go back to a saved chat (its transcript and its pi session)
+//   POST /api/chats/delete {id} forget a saved chat
 //   GET|PUT /api/store/<app>/<key>   a tiny JSON store for apps
 
 import http from "node:http";
@@ -33,7 +35,12 @@ const MODEL = process.env.PI_MODEL || "qwen3.8-flash-next-iq3_s";
 const STRATA_HEALTH = process.env.STRATA_HEALTH || "http://127.0.0.1:8080/health";
 const MAX_REPAIRS = 2;
 
+const CHATS = path.join(STATE, "chats");
+const SESSIONS = path.join(STATE, "sessions");
+const UNDO = path.join(STATE, "undo.json");
 fs.mkdirSync(STORE, { recursive: true });
+fs.mkdirSync(CHATS, { recursive: true });
+fs.mkdirSync(SESSIONS, { recursive: true });
 
 // ── git: os/ has its own history; every agent turn is a commit ──────────
 // The history lives in state/os.git (outside os/), so os/ stays plain files
@@ -70,6 +77,8 @@ const state = {
   blocks: [],            // { id, kind: user|assistant|thinking|tool|system, text, name?, status?, output? }
   busy: false,
   rev: 1,                // the shell remounts the OS when this moves
+  scope: "os",           // what the last move touched: "os" (reload the page) or "apps" (reopen their windows)
+  changed: [],           // with scope "apps": the ids of the apps that changed
   broken: "",            // the desktop's verification failure, "" when it is sound
   model: "unknown",      // ready | asleep | loading | offline
   canUndo: false,
@@ -80,19 +89,22 @@ const clients = new Set();
 function send(res, msg) { res.write(`data: ${JSON.stringify(msg)}\n\n`); }
 function broadcast(msg) { for (const c of clients) send(c, msg); }
 function stateMsg() {
-  return { op: "state", busy: state.busy, rev: state.rev, broken: state.broken, model: state.model, canUndo: state.canUndo };
+  return { op: "state", busy: state.busy, rev: state.rev, scope: state.scope, changed: state.changed,
+    broken: state.broken, model: state.model, canUndo: state.canUndo };
 }
 function pushBlock(b) {
   foldThinking();
   const block = { id: "b" + ++seq, text: "", ...b };
   state.blocks.push(block);
   broadcast({ op: "push", block });
+  saveSoon();
   return state.blocks.length - 1;
 }
 function patchBlock(i, fields) {
   flushAppends();
   Object.assign(state.blocks[i], fields);
   broadcast({ op: "patch", i, fields });
+  saveSoon();
 }
 // a thinking block streams open; anything after it folds it to "Thought"
 function foldThinking() {
@@ -114,7 +126,64 @@ function flushAppends() {
   clearTimeout(flushTimer);
   flushTimer = null;
   for (const [i, text] of pending) broadcast({ op: "append", i, text });
+  if (pending.size) saveSoon();
   pending.clear();
+}
+
+// ── chats: every conversation is kept ───────────────────────────────────
+// state/chats/<id>.json holds a chat's transcript and the pi session file it
+// belongs to, so going back to a chat brings back the agent's memory of it
+// too. state/chats/index.json names the open one; a restart resumes it.
+
+const chat = { id: "", title: "", created: 0, updated: 0, sessionFile: "" };
+const chatFile = (id) => path.join(CHATS, id + ".json");
+const newChatId = () => new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14) + "-" + Math.random().toString(36).slice(2, 6);
+
+function readChat(id) {
+  try { return JSON.parse(fs.readFileSync(chatFile(id), "utf8")); } catch { return null; }
+}
+function saveChat() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  if (!chat.id || state.blocks.length === 0) return;   // an empty chat is not worth keeping
+  chat.updated = Date.now();
+  fs.writeFileSync(chatFile(chat.id), JSON.stringify({ ...chat, blocks: state.blocks }));
+  fs.writeFileSync(path.join(CHATS, "index.json"), JSON.stringify({ current: chat.id }));
+}
+let saveTimer = null;
+function saveSoon() { if (!saveTimer) saveTimer = setTimeout(saveChat, 1000); }
+
+function listChats() {
+  const out = [];
+  for (const f of fs.readdirSync(CHATS)) {
+    if (!f.endsWith(".json") || f === "index.json") continue;
+    const c = readChat(f.slice(0, -5));
+    if (c) out.push({ id: c.id, title: c.title || "Untitled chat", updated: c.updated, count: (c.blocks || []).filter((b) => b.kind === "user").length });
+  }
+  if (chat.id && !out.some((c) => c.id === chat.id) && state.blocks.length) out.push({ id: chat.id, title: chat.title, updated: Date.now(), count: 1 });
+  return out.sort((a, b) => b.updated - a.updated);
+}
+function chatsMsg() { return { op: "chats", current: chat.id, chats: listChats() }; }
+function announceChats() { broadcast(chatsMsg()); }
+
+function beginChat() {
+  Object.assign(chat, { id: newChatId(), title: "", created: Date.now(), updated: Date.now(), sessionFile: "" });
+  state.blocks = [];
+  seq = 0;
+}
+// the chat to resume at startup: the last open one, else a fresh one
+function resumeChat() {
+  let cur = null;
+  try { cur = readChat(JSON.parse(fs.readFileSync(path.join(CHATS, "index.json"), "utf8")).current); } catch {}
+  if (!cur) { beginChat(); return; }
+  Object.assign(chat, { id: cur.id, title: cur.title || "", created: cur.created || Date.now(), updated: cur.updated || Date.now(), sessionFile: cur.sessionFile || "" });
+  state.blocks = cur.blocks || [];
+  seq = state.blocks.reduce((n, b) => Math.max(n, +String(b.id).slice(1) || 0), 0);
+}
+// after pi starts or changes session: remember which file this chat lives in
+async function noteSession() {
+  const r = await command({ type: "get_state" });
+  if (r.success && r.data?.sessionFile) chat.sessionFile = r.data.sessionFile;
 }
 
 // ── pi ──────────────────────────────────────────────────────────────────
@@ -129,12 +198,14 @@ function systemPrompt() {
 
 function startPi() {
   const args = [
-    "--mode", "rpc", "--no-session",
+    "--mode", "rpc", "--session-dir", SESSIONS,
     "--provider", PROVIDER, "--model", MODEL,
     "--no-context-files", "--no-skills", "--no-prompt-templates",
     "--append-system-prompt", systemPrompt(),
   ];
   if (!process.env.PI_EXTENSIONS) args.push("--no-extensions", "--no-mcp");
+  // the open chat's session, so the agent remembers it (else pi starts a new one)
+  if (chat.sessionFile && fs.existsSync(chat.sessionFile)) args.push("--session", chat.sessionFile);
   pi = spawn("pi", args, { cwd: OS, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env } });
   let buf = "";
   pi.stdout.setEncoding("utf8");
@@ -160,7 +231,7 @@ function startPi() {
 }
 
 function command(cmd) {
-  if (!pi) startPi();
+  if (!pi) { startPi(); if (cmd.type !== "get_state") noteSession(); }
   const id = "c" + ++cmdSeq;
   return new Promise((resolve) => {
     waiting.set(id, resolve);
@@ -313,7 +384,10 @@ const undoStack = [];
 async function startTurn(text) {
   if (state.busy) return { ok: false, error: "busy" };
   setState({ busy: true });
+  if (!chat.title) { chat.title = text.length > 60 ? text.slice(0, 57).trimEnd() + "…" : text; }
   pushBlock({ kind: "user", text });
+  saveChat();
+  announceChats();
   try {
     if (await commitAll("manual edits")) system("Saved your manual edits as a snapshot first.");
     turn = { prompt: text, before: await head(), repairs: 0 };
@@ -385,16 +459,31 @@ async function afterTurn(aborted) {
   await commitTurn(v, aborted);
 }
 
+// What a set of changed files means for the page: apps only (their open
+// windows reopen in place) or the OS itself (the page reloads).
+function scopeOf(files) {
+  const ids = new Set();
+  for (const f of files) {
+    const m = f.match(/^apps\/([^/]+)\//);
+    if (m) ids.add(m[1]);
+    else if (f !== "apps.json" && f !== "AGENTS.md") return { scope: "os", changed: [] };
+  }
+  return { scope: "apps", changed: [...ids] };
+}
+
+function saveUndo() { try { fs.writeFileSync(UNDO, JSON.stringify(undoStack)); } catch {} }
+
 async function commitTurn(v, aborted = false) {
   const label = (aborted ? "agent (stopped): " : "agent: ") + turn.prompt;
   await commitAll(label);
   undoStack.push({ before: turn.before, after: await head(), prompt: turn.prompt });
+  saveUndo();
   console.log(`[turn] ${label} → ${v.changed.join(", ")}${v.problems.length ? "\n" + v.problems.join("\n") : ""}`);
   if (v.problems.length) system(`The change to ${summaryOf(v.changed)} still has a problem I couldn't fix. It's kept so you can try it — Undo takes it back.`);
   else system(`Done — updated ${summaryOf(v.changed)}.`);
   // a broken desktop is not remounted: the shell keeps the last good OS running
-  const rev = v.desktopBad ? state.rev : state.rev + 1;
-  finishTurn(false, { rev, broken: v.desktopBad });
+  if (v.desktopBad) finishTurn(false, { broken: v.desktopBad });
+  else finishTurn(false, { rev: state.rev + 1, broken: "", ...scopeOf(v.changed) });
 }
 
 function finishTurn(_crashed, extra = {}) {
@@ -402,16 +491,19 @@ function finishTurn(_crashed, extra = {}) {
   flushAppends();
   foldThinking();
   setState({ busy: false, canUndo: undoStack.length > 0, ...extra });
+  saveChat();
 }
 
 async function undo() {
   if (state.busy) return { ok: false, error: "busy" };
   const last = undoStack.pop();
   if (!last) return { ok: false, error: "nothing to undo" };
+  saveUndo();
   await commitAll("manual edits");
+  const files = (await git("diff", "--name-only", last.before, last.after)).split("\n").filter(Boolean);
   await git("revert", "--no-edit", `${last.before}..${last.after}`);
   system(`Undid: “${last.prompt}”`);
-  setState({ rev: state.rev + 1, broken: "", canUndo: undoStack.length > 0 });
+  setState({ rev: state.rev + 1, broken: "", canUndo: undoStack.length > 0, ...scopeOf(files) });
   return { ok: true };
 }
 
@@ -429,17 +521,66 @@ async function factory() {
   fs.writeFileSync(path.join(OS, "AGENTS.md"), notes);
   await commitAll("factory reset");
   undoStack.length = 0;
+  saveUndo();
   system("Restored the OS to its factory state.");
-  setState({ rev: state.rev + 1, broken: "", canUndo: false });
+  setState({ rev: state.rev + 1, broken: "", canUndo: false, scope: "os", changed: [] });
   return { ok: true };
 }
 
 async function newChat() {
   if (state.busy) return { ok: false, error: "busy" };
+  if (state.blocks.length === 0) return { ok: true };    // already a fresh one
+  saveChat();
   if (pi) await command({ type: "new_session" });
-  state.blocks = [];
+  beginChat();
+  if (pi) await noteSession();
   broadcast({ op: "reset", blocks: [] });
+  announceChats();
   return { ok: true };
+}
+
+async function openChat(id) {
+  if (state.busy) return { ok: false, error: "busy" };
+  if (id === chat.id) return { ok: true };
+  const c = readChat(String(id));
+  if (!c) return { ok: false, error: "no such chat" };
+  saveChat();
+  Object.assign(chat, { id: c.id, title: c.title || "", created: c.created, updated: c.updated, sessionFile: c.sessionFile || "" });
+  state.blocks = c.blocks || [];
+  seq = state.blocks.reduce((n, b) => Math.max(n, +String(b.id).slice(1) || 0), 0);
+  if (pi) {
+    if (chat.sessionFile && fs.existsSync(chat.sessionFile)) await command({ type: "switch_session", sessionPath: chat.sessionFile });
+    else { await command({ type: "new_session" }); await noteSession(); }
+  }
+  fs.writeFileSync(path.join(CHATS, "index.json"), JSON.stringify({ current: chat.id }));
+  broadcast({ op: "reset", blocks: state.blocks });
+  announceChats();
+  return { ok: true };
+}
+
+async function deleteChat(id) {
+  id = String(id);
+  if (!/^[\w-]+$/.test(id)) return { ok: false, error: "bad id" };
+  if (id === chat.id) {
+    if (state.busy) return { ok: false, error: "busy" };
+    const sf = chat.sessionFile;
+    try { fs.unlinkSync(chatFile(id)); } catch {}
+    if (sf) try { fs.unlinkSync(sf); } catch {}
+    state.blocks = [];
+    await newChatAfterDelete();
+  } else {
+    const c = readChat(id);
+    try { fs.unlinkSync(chatFile(id)); } catch {}
+    if (c?.sessionFile && c.sessionFile.startsWith(SESSIONS)) try { fs.unlinkSync(c.sessionFile); } catch {}
+  }
+  announceChats();
+  return { ok: true };
+}
+async function newChatAfterDelete() {
+  if (pi) await command({ type: "new_session" });
+  beginChat();
+  if (pi) await noteSession();
+  broadcast({ op: "reset", blocks: [] });
 }
 
 // ── the model's health, for the panel's status dot ──────────────────────
@@ -479,6 +620,7 @@ const server = http.createServer(async (req, res) => {
       res.write("retry: 1500\n\n");
       send(res, { op: "reset", blocks: state.blocks });
       send(res, stateMsg());
+      send(res, chatsMsg());
       clients.add(res);
       const ping = setInterval(() => res.write(": ping\n\n"), 20000);
       req.on("close", () => { clearInterval(ping); clients.delete(res); });
@@ -493,6 +635,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && p === "/api/undo") return json(res, 200, await undo());
     if (req.method === "POST" && p === "/api/factory") return json(res, 200, await factory());
     if (req.method === "POST" && p === "/api/newchat") return json(res, 200, await newChat());
+    if (req.method === "POST" && p === "/api/chats/open") return json(res, 200, await openChat((await body(req)).id));
+    if (req.method === "POST" && p === "/api/chats/delete") return json(res, 200, await deleteChat((await body(req)).id));
     const m = p.match(/^\/api\/store\/([^/]+)\/([^/]+)$/);
     if (m && safe(m[1]) && safe(m[2])) {
       const file = path.join(STORE, m[1], m[2] + ".json");
@@ -515,6 +659,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 await ensureRepo();
+resumeChat();
+try { undoStack.push(...JSON.parse(fs.readFileSync(UNDO, "utf8"))); state.canUndo = undoStack.length > 0; } catch {}
 await pollModel();
 setInterval(pollModel, 10000);
 server.listen(PORT, "127.0.0.1", () => console.log(`agent bridge → http://127.0.0.1:${PORT}/api  (pi: ${PROVIDER}/${MODEL}, workspace: ${OS})`));

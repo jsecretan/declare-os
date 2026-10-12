@@ -40,12 +40,12 @@
       "title": "Calculator",
       "kind": "program",
       "program": "apps/calculator/calculator",
-      "width": 300,
-      "height": 440,
+      "width": 340,
+      "height": 620,
       "glyph": "±",
       "hue1": "#FF9F0A",
       "hue2": "#D9680A",
-      "blurb": "A four-function calculator."
+      "blurb": "A scientific calculator."
     },
     {
       "id": "clock",

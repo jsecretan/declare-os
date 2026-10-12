@@ -33,6 +33,11 @@ schema AppRec [
     ]
 
 script {
+    // the shell's saved session (JSON) → its window list ([] when unreadable)
+    function parseWins(s: string): object[] {
+        try { return (JSON.parse(s) as { wins?: object[] }).wins ?? [] } catch (e) { return [] }
+    }
+
     // "#RRGGBB" → a Color number; a bad or missing value falls to `dflt`
     function hex(s: string | undefined, dflt: number): number {
         if (s == null || s.length < 7 || s[0] != "#") return dflt
@@ -85,7 +90,7 @@ class WinManager extends Node [
         this.list.insert(["wins"], at, rec)
         },
 
-    focusNew(id: string) { this.frontId = id },
+    focusNew(id: string) { this.frontId = id; this.saveSoon() },
 
     // a raise is a move to the top of the normal band
     raiseWin(w: Window) {
@@ -107,6 +112,57 @@ class WinManager extends Node [
     removeWin(id: string) {
         const i = this.idxOf(id)
         if (i >= 0) this.list.removeAt(["wins"], i)
+        this.saveSoon()
+        },
+
+    // ── the session: the open windows, as the shell keeps them across a reload ──
+
+    saving: boolean = false,
+    saveSoon() {
+        if (saving) return
+        saving = true
+        afterDelay(400, () => { saving = false; this.saveSession() })
+        },
+    snapshot() -> object[] {
+        const out = [] as object[]
+        for (const r of this.recs()) {
+            if (r.cls == "AboutWindow") continue
+            const w = this.winOf(r.id)
+            if (w == null || w.closing) continue
+            out.push(({ cls: r.cls, appId: r.appId, front: r.id == this.frontId,
+                props: ({ ...(r.props as object), wx: w.wx, wy: w.wy, width: w.width, height: w.height, bornX: -1, bornY: -1 }) }))
+            }
+        return out
+        },
+    saveSession() { app.post("session", ({ wins: this.snapshot() })) },
+
+    restoreSession(wins: object[]) {
+        for (const s of wins) {
+            const id = this.mintId()
+            this.spawn()
+            this.addWin(({ id: id, cls: s.cls, appId: s.appId, mini: false, props: ({ ...(s.props as object), rev: app.rev }) }))
+            app.launcher.setRunning("" + s.appId, true)
+            if (s.front == true) this.frontId = id
+            }
+        this.saveSoon()
+        },
+
+    // an app the agent changed: each of its windows is replaced, where it
+    // stood and at its size, by one that loads the new program
+    refreshApps(ids: string[]) {
+        if (ids.length == 0) return
+        for (const r of this.recs()) {
+            if (r.cls != "AppWindow" || !ids.includes("" + r.appId)) continue
+            const w = this.winOf(r.id)
+            if (w == null || w.closing) continue
+            const front = r.id == this.frontId
+            const id = this.mintId()
+            const props = ({ ...(r.props as object), wx: w.wx, wy: w.wy, width: w.width, height: w.height, bornX: -1, bornY: -1, rev: app.rev })
+            this.removeWin(r.id)
+            this.addWin(({ id: id, cls: r.cls, appId: r.appId, mini: false, props: props }))
+            if (front) this.frontId = id
+            }
+        this.saveSoon()
         },
 
     focusWin(w: Window?) { if (w == null) return; if (this.isMin(w)) this.restoreMini(w); else w.activate() },
@@ -299,7 +355,7 @@ class Launcher extends Node [
             const wy = 24 + (n % 6) * 26
             const o = this.originOf(v)
             this.openWin(app.wm.mintId(), "AppWindow", a.id,
-                ({ program: "" + (a.program ?? ""), width: ww, height: wh, wx: wx, wy: wy,
+                ({ program: "" + (a.program ?? ""), rev: app.rev, width: ww, height: wh, wx: wx, wy: wy,
                     bornX: o != null ? o.x - wx : -1, bornY: o != null ? o.y - wy - app.menuBarH : -1 }), v)
             })
         },

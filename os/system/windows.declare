@@ -43,6 +43,10 @@ class Window [ width = 560, height = 400, clip = true,
     // Open zoom: the window grows from where it launched (bornX/bornY, in
     // window coordinates; -1 = no origin, so it zooms gently from its center)
 
+    // where it is and how big, kept so a reload can put it back
+    trackChanges = ["wx", "wy", "width", "height"],
+    onChange() { app.wm.saveSoon() },
+
     bornX: number = { :props.bornX ?? -1 },
     bornY: number = { :props.bornY ?? -1 },
     bornFrom: View? = null,
@@ -409,6 +413,7 @@ store's address (`store`).
 
 class AppWindow extends Window [ width = 640, height = 460,
     program: string = { :props.program ?? "" },
+    openRev: number = { :props.rev ?? 0 },       // the OS revision this window's program was loaded at
     rec: AppRec? = { app.launcher.byId(this.appId) },
 
     // the title is the hosted app's own appName, else the registry's title
@@ -421,7 +426,7 @@ class AppWindow extends Window [ width = 640, height = 460,
 
         // programs resolve from the OS folder; app.programPath adds the
         // revision so an app the agent just changed reloads fresh
-        program = { app.programPath(classroot.program) },
+        program = { app.programPath(classroot.program, classroot.openRev) },
         provides = ["dark", "base", "store"],
         dark: boolean = { app.darkMode },
         base: string = { app.osBase + classroot.program.split("/").slice(0, -1).join("/") + "/" },

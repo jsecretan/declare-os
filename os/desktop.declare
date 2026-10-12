@@ -113,13 +113,20 @@ App [ appName = "Declare OS", scrolls = none,
 
     osBase: string = { hostProvided("base", "") },   // this folder, in the page's URL space
     rev: number = { hostProvided("rev", 0) },        // bumped on every agent change
+    changedApps: string = { hostProvided("changed", "") },   // with a rev that touched only apps: their ids, comma-separated
+    session: string = { hostProvided("session", "") },       // the windows open before the page last reloaded (JSON)
 
     // An app's program path, relative to this folder ("apps/clock/clock"),
     // as an island names it. Island names resolve from the page's demos/
-    // folder, hence "../" plus this folder's base; the revision segment makes
-    // a changed app a new name, so it is fetched fresh instead of reused
-    // from the island cache.
-    programPath(p: string) -> string { return p == "" ? "" : "../r" + this.rev + "/../" + (this.osBase.startsWith("/") ? this.osBase.slice(1) : this.osBase) + p },
+    // folder, hence "../" plus this folder's base; the revision segment (the
+    // rev the window opened at) makes a changed app a new name, so it is
+    // fetched fresh instead of reused from the island cache.
+    programPath(p: string, r: number) -> string { return p == "" ? "" : "../r" + r + "/../" + (this.osBase.startsWith("/") ? this.osBase.slice(1) : this.osBase) + p },
+
+    // A change that touched only apps doesn't reload the page: the windows
+    // of those apps reopen in place, on the new code.
+    revWatch: Node [ seen: number = { app.rev }, trackChanges = ["seen"],
+        onChange() { app.wm.refreshApps(app.changedApps.split(",").filter((s) => s != "")) } ],
 
     // The assistant lives in the host shell; ask it to open (with an
     // optional prefilled prompt).
@@ -150,7 +157,11 @@ App [ appName = "Declare OS", scrolls = none,
 
     dockDismiss() { app.bar.dismissMenus() },
     onPointerDown() { app.launcher.dismissAbouts() },
-    onReady() { app.launcher.openWelcome() },
+    // the windows that were open before a reload come back; a first visit gets the welcome note
+    onReady() {
+        if (app.session != "") app.wm.restoreSession(parseWins(app.session))
+        else app.launcher.openWelcome()
+        },
 
     keys: Keys [
         onKeyDown(e: KeyEvent) {

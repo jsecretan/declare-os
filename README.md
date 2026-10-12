@@ -33,8 +33,9 @@ server/agent.mjs     the bridge: pi --mode rpc ↔ chat over SSE, verify,
                        auto-repair, commit, undo, factory reset, app store
 server/start.mjs     runs the bridge (8851) + the Declare dev server (8850,
                        proxying /api to the bridge)
-state/               not checked in: os/'s turn-by-turn history (os.git) and
-                       app data saved through /api/store
+state/               not checked in: os/'s turn-by-turn history (os.git), the
+                       saved chats (chats/) and their pi sessions (sessions/),
+                       the undo stack, and app data saved through /api/store
 ```
 
 **A turn**: the shell POSTs `/api/prompt`; the bridge snapshots `os/` with git
@@ -46,6 +47,16 @@ to the agent to fix (twice at most). Then it commits and bumps the revision; the
 shell remounts the OS with that revision in its program name, so it is fetched
 fresh. If the desktop itself fails to verify, the revision is not bumped — the
 last good OS keeps running, and the panel offers Undo.
+
+**What reloads**: a change that touched only apps (`apps/…`, `apps.json`)
+doesn't reload the page — the OS reopens those apps' open windows in place, at
+the same spot and size, on the new code (state inside them starts fresh unless
+the app saves it). Any other change reloads the page, and the OS puts back the
+windows it had open (it keeps them in the tab's sessionStorage, so a manual
+refresh restores them too).
+
+**Chats** are all kept: **History** in the panel lists them, and opening one
+brings back its transcript and the agent's own memory of it (its pi session).
 
 **Undo** reverts the last agent turn as new commits; **factory reset**
 (`POST /api/factory`) restores the tree at the `factory` tag — on a fresh

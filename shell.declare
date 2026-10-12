@@ -8,19 +8,37 @@ in an island that fills the page, and floats the assistant panel above it.
   operations — reset, push a block, append text to one, patch one, state —
   which `apply` writes into the `chat` dataset the panel replicates.
 - **A prompt** is one POST (/api/prompt); the reply streams in on the events.
-- **A change** to the OS bumps `rev`, and the page reloads: every program is
-  then fetched and compiled fresh from disk, and the conversation replays from
-  the bridge. Whether the panel is open is the page's location (`#chat`), so
-  it comes back as it was. A change that broke the desktop doesn't bump `rev`,
-  so the last good OS keeps running; the panel says so, and Undo puts it back.
+- **A change** bumps `rev`. One that touched only apps is handed to the OS
+  (`rev` + `changed`), which reopens those apps' windows in place on the new
+  code. Any other change reloads the page: every program is fetched and
+  compiled fresh, the conversation replays from the bridge, and the OS puts
+  back the windows it had open (it posts them here as `session`; this keeps
+  them in the tab's sessionStorage). Whether the panel is open is the page's
+  location (`#chat`), so it comes back as it was. A change that broke the
+  desktop doesn't bump `rev`, so the last good OS keeps running; the panel
+  says so, and Undo puts it back.
+- **Chats** are all kept by the bridge; History lists them, and opening one
+  brings back its transcript and the agent's memory of it.
 */
 
 script {
-    // the one host call the shell needs: a fresh load of everything
+    // the host calls the shell needs: a fresh load of everything, and a place
+    // for the OS's open windows that outlives it (this tab only)
     function reloadPage(): void { location.reload() }
+    function keepSession(s: string): void { try { sessionStorage.setItem("declare-os.session", s) } catch (e) {} }
+    function keptSession(): string { try { return sessionStorage.getItem("declare-os.session") ?? "" } catch (e) { return "" } }
+
+    // a chat's last activity, briefly: "2:41 PM" today, else "Oct 9"
+    function when(ms: number): string {
+        const d = new Date(ms)
+        const now = new Date()
+        if (d.toDateString() == now.toDateString()) return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+        return d.toLocaleDateString([], { month: "short", day: "numeric" })
+    }
 }
 
 schema ChatItem [ id: string, kind: string, text: string, name?: string, status?: string, output?: string ]
+schema ChatRec [ id: string, title: string, updated: number, count: number ]
 
 
 /*
@@ -80,6 +98,21 @@ class ToolBlock extends Block [ height = 22,
         text = { "" + :text + (:status == "running" ? "…" : "") } ]
     ]
 
+// a saved chat in the History list: press to go back to it
+class ChatRow extends Control [ width = 100%, height = 46, cornerRadius = 9,
+    current: boolean = { :id == app.chatId },
+    fill = { this.current ? 0x0A84FF33 : this.hovered ? 0xFFFFFF1A : 0xFFFFFF0D },
+    press() { app.openSaved("" + :id) },
+    t: Text [ x = 12, y = 7, fontSize = 13, fontWeight = medium, textColor = #F2F2F7, wrap = false, clip = true,
+        width = { parent.width - 52 }, text = { "" + :title } ],
+    sub: Text [ x = 12, y = 26, fontSize = 11, textColor = #98989D,
+        text = { when(:updated) + " · " + :count + (:count == 1 ? " request" : " requests") + (classroot.current ? " · open now" : "") } ],
+    del: View [ visible = { classroot.hovered }, x = { parent.width - 34 }, y = center, width = 24, height = 24, cornerRadius = 6,
+        fill = { this.hovered ? 0xFF453A40 : 0xFFFFFF00 }, cursor = "pointer", tooltipLabel = "Delete this chat",
+        onClick() { app.forget("" + :id) },
+        Text [ x = center, y = center, fontSize = 12, textColor = #FF9F94, text = "✕" ] ]
+    ]
+
 class SystemBlock extends Block [
     t: Text [ x = center, width = { Math.min(this.contentWidth, parent.width - 20) }, wrap = true,
         textAlign = center, fontSize = 11.5, textColor = #98989D, text = :text ]
@@ -122,6 +155,10 @@ App [ appName = "Declare OS", scrolls = none, fill = #000000,
     connected: boolean = { app.events.status == "open" },
 
     chat: Dataset [ schema = [ blocks[]: ChatItem ] ] { { "blocks": [] } },
+    chats: Dataset [ schema = [ chats[]: ChatRec ] ] { { "chats": [] } },
+    chatId: string = "",
+    historyOpen: boolean = false,
+    changed: string = "",                        // with an apps-only rev: which apps changed
     empty: boolean = { (app.chat.value?.blocks ?? []).length == 0 },
 
     events: EventStream [ url = "/api/events",
@@ -134,13 +171,17 @@ App [ appName = "Declare OS", scrolls = none, fill = #000000,
             const cur = app.chat.value?.blocks[m.i]
             if (cur != null) app.chat.set(["blocks", m.i, "text"], cur.text + m.text)
             }
+        else if (m.op == "chats") { app.chats.set(["chats"], m.chats); app.chatId = m.current }
         else if (m.op == "patch") { for (const k of Object.keys(m.fields)) app.chat.set(["blocks", m.i, k], m.fields[k]) }
         else if (m.op == "state") {
             app.busy = m.busy
             app.broken = m.broken
             app.model = m.model
             app.canUndo = m.canUndo
-            if (app.rev != 0 && m.rev != app.rev) reloadPage()   // the OS changed under us
+            if (app.rev != 0 && m.rev != app.rev) {
+                if (m.scope == "apps") { app.changed = (m.changed ?? []).join(","); app.rev = m.rev }   // the OS reopens those apps
+                else reloadPage()                                                                       // the OS itself changed
+                }
             else app.rev = m.rev
             }
         if (m.op == "reset") { app.following = true; afterSettle(app.toEnd) }
@@ -173,6 +214,18 @@ App [ appName = "Declare OS", scrolls = none, fill = #000000,
     aborter: DataSource [ url = "/api/abort", method = "POST" ],
     undoer: DataSource [ url = "/api/undo", method = "POST" ],
     fresh: DataSource [ url = "/api/newchat", method = "POST" ],
+    opener: DataSource [ url = "/api/chats/open", method = "POST" ],
+    openSaved(id: string) {
+        app.historyOpen = false
+        if (id == app.chatId) return
+        app.opener.body = ({ id: id })
+        app.opener.fetch()
+        },
+    deleter: DataSource [ url = "/api/chats/delete", method = "POST" ],
+    forget(id: string) {
+        app.deleter.body = ({ id: id })
+        app.deleter.fetch()
+        },
 
     // ── the panel's place ──
 
@@ -199,11 +252,14 @@ App [ appName = "Declare OS", scrolls = none, fill = #000000,
         // island names resolve from this folder's demos/; mounted once the
         // bridge has said which revision this is
         program = { app.rev == 0 ? "" : "../os/desktop" },
-        provides = ["base", "rev"],
+        provides = ["base", "rev", "changed", "session"],
         base: string = "/os/",                   // absolute: a remounted tenant resolves relative URLs from elsewhere
         rev: number = { app.rev },
+        changed: string = { app.changed },
+        session: string = { keptSession() },     // read once, at mount
         onPost(m: IslandPost) {
             if (m.topic == "assistant") app.openChat("" + ((m.payload as { text?: string })?.text ?? ""))
+            else if (m.topic == "session") keepSession(JSON.stringify(m.payload))
             }
         ],
 
@@ -254,8 +310,10 @@ App [ appName = "Declare OS", scrolls = none, fill = #000000,
                 layout: SimpleLayout [ axis = x, spacing = 2, align = center ],
                 HeadButton [ label = "Undo", tooltipLabel = "Revert the last change to the OS",
                     disabled = { !app.canUndo || app.busy }, act() { app.undoer.fetch() } ],
+                HeadButton [ label = { app.historyOpen ? "Back" : "History" }, tooltipLabel = "Your earlier chats",
+                    disabled = { app.busy && !app.historyOpen }, act() { app.historyOpen = !app.historyOpen } ],
                 HeadButton [ label = "New chat", tooltipLabel = "Start a fresh conversation",
-                    disabled = { app.busy }, act() { app.fresh.fetch() } ],
+                    disabled = { app.busy }, act() { app.historyOpen = false; app.fresh.fetch() } ],
                 HeadButton [ label = "✕", act() { app.location = "" } ]
                 ]
             ],
@@ -277,8 +335,19 @@ App [ appName = "Declare OS", scrolls = none, fill = #000000,
                 ]
             ],
 
+        // the saved chats, over the conversation while open
+        history: View [ visible = { app.historyOpen }, x = 0, y = 49, width = 100%, height = { parent.height - 49 },
+            fill = #1C1C1E, scrolls = y, padding = [12, 12, 12, 12],
+            datapath = { app.chats.value },
+            layout: SimpleLayout [ axis = y, spacing = 6 ],
+            Text [ fontSize = 11, fontWeight = semibold, textColor = #8E8E93, text = "CHATS" ],
+            Text [ visible = { (app.chats.value?.chats ?? []).length == 0 }, fontSize = 13, textColor = #98989D,
+                text = "No saved chats yet." ],
+            ChatRow [ datapath = :chats[], key = :id ]
+            ],
+
         // shown while there is no conversation yet
-        hello: View [ visible = { app.empty }, x = 16, y = 70, width = { parent.width - 32 },
+        hello: View [ visible = { app.empty && !app.historyOpen }, x = 16, y = 70, width = { parent.width - 32 },
             layout: SimpleLayout [ axis = y, spacing = 8 ],
             Text [ width = 100%, wrap = true, fontSize = 13, textColor = #C7C7CC,
                 text = "Ask for a new app, or for any change to the OS — its dock, windows, menus or look. The agent edits the OS's Declare source, checks it, and reloads it." ],
