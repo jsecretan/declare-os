@@ -1,8 +1,9 @@
 // The agent bridge: one long-lived `pi --mode rpc` process working in os/,
 // its event stream turned into chat operations the shell applies, and the
 // bookkeeping around each turn — a git snapshot before, verification after
-// (with automatic repair), a commit, and a revision bump that tells the shell
-// to remount the OS.
+// (with automatic repair), a look at each changed app (a picture the model
+// checks, and fixes what it sees), a commit, and a revision bump that tells
+// the shell to remount the OS.
 //
 // HTTP surface (proxied from the Declare dev server under /api):
 //   GET  /api/events            SSE: {op:"reset"|"push"|"append"|"patch"|"state", …}
@@ -21,6 +22,8 @@ import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+import { look } from "./look.mjs";
+
 const run = promisify(execFile);
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -34,6 +37,10 @@ const PROVIDER = process.env.PI_PROVIDER || "strata";
 const MODEL = process.env.PI_MODEL || "qwen3.8-flash-next-iq3_s";
 const STRATA_HEALTH = process.env.STRATA_HEALTH || "http://127.0.0.1:8080/health";
 const MAX_REPAIRS = 2;
+// after a clean verify, take pictures of the changed apps and let the model
+// check them once (LOOK=0 turns it off; it needs an image-capable model)
+const LOOK = process.env.LOOK !== "0";
+const MAX_LOOKS = 3;   // apps pictured per turn
 
 const CHATS = path.join(STATE, "chats");
 const SESSIONS = path.join(STATE, "sessions");
@@ -284,7 +291,13 @@ function bashTarget(cmd) {
   const f = cmd.match(/(?:\.\.\/|\/)?[\w./-]*\.(?:declare|json|md)\b/);
   return f ? thing(f[0]) : /\bapps\b/.test(cmd) ? "the apps" : "the system";
 }
+function pictureOf(s) {
+  const m = String(s || "").match(/looks\/([\w-]+)\.png|look\.mjs\s+([\w-]+)/);
+  return m ? thing(`apps/${m[1] || m[2]}/`) : null;
+}
 function describe(name, a = {}) {
+  if (name === "read" && pictureOf(a.path)) return "Checking how " + pictureOf(a.path) + " looks";
+  if (name === "bash" && /look\.mjs/.test(a.command || "")) return "Taking a picture of " + (pictureOf(a.command) || "the app");
   if (name === "read") return "Looking at " + thing(a.path);
   if (name === "edit") return "Changing " + thing(a.path);
   if (name === "write") {
@@ -339,6 +352,7 @@ function onRecord(r) {
       break;
     }
     case "tool_execution_start": {
+      if (turn) noteLook(r.toolName, r.args || {});
       const text = describe(r.toolName, r.args);
       // the same step again right after itself ("Looking at the dock", twice) is one line
       const last = state.blocks.length - 1;
@@ -390,7 +404,7 @@ async function startTurn(text) {
   announceChats();
   try {
     if (await commitAll("manual edits")) system("Saved your manual edits as a snapshot first.");
-    turn = { prompt: text, before: await head(), repairs: 0 };
+    turn = { prompt: text, before: await head(), repairs: 0, looked: false, seen: new Set() };
     const r = await command({ type: "prompt", message: text });
     if (!r.success) { system("The agent refused the prompt: " + r.error); finishTurn(false); }
     else if (r.data?.disposition === "handled") finishTurn(false);
@@ -456,7 +470,51 @@ async function afterTurn(aborted) {
     if (!r.success) { system("Repair prompt refused: " + r.error); await commitTurn(v); }
     return;
   }
+  if (LOOK && !aborted && !turn.looked && !v.problems.length) {
+    turn.looked = true;
+    if (await lookAt(v)) return;
+  }
   await commitTurn(v, aborted);
+}
+
+// which apps the agent has already seen a picture of since it last changed
+// them — the post-turn look skips those
+function noteLook(name, a) {
+  const pic = String(a.path || "").match(/looks\/([\w-]+)\.png$/);
+  if (name === "read" && pic) { turn.seen.add(pic[1]); return; }
+  const f = rel(a.path || "").match(/^apps\/([^/]+)\//);
+  if ((name === "edit" || name === "write") && f) turn.seen.delete(f[1]);
+  // a shell command that could have changed files (not a look, a test or a read)
+  else if (name === "bash" && !/look\.mjs|declare-verify|verify\.mjs|declare-help|^\s*(ls|cat|head|tail|grep|rg|find|sed -n|wc|tree)\b/.test(a.command || "")) turn.seen.clear();
+}
+
+// The program apps a change touched (new ones included), pictured at their
+// window size; the model reads the pictures and fixes what it can see.
+// Returns false when there is nothing to look at (or no way to), and the
+// turn commits as it is.
+async function lookAt(v) {
+  let reg = {};
+  try { reg = JSON.parse(fs.readFileSync(path.join(OS, "apps.json"), "utf8")); } catch {}
+  const programs = new Set((reg.apps || []).filter((a) => a.kind === "program").map((a) => a.id));
+  const ids = [...new Set(v.changed.map((f) => (f.match(/^apps\/([^/]+)\//) || [])[1]).filter((id) => programs.has(id) && !turn.seen.has(id)))].slice(0, MAX_LOOKS);
+  if (!ids.length) return false;
+  const i = pushBlock({ kind: "tool", name: "look", text: "Checking how " + summaryOf(ids.map((id) => `apps/${id}/`)) + " looks", status: "running" });
+  const shots = [];
+  for (const id of ids) {
+    try { shots.push(await look(id)); }
+    catch (e) { console.log(`[look] ${id}: ${e.message}`); }
+  }
+  patchBlock(i, { status: "ok" });
+  if (!shots.length) return false;
+  const msg = "Your change verifies. Now check how it looks. Use the read tool on each picture below — each is the app exactly as it shows in its window — and look at it the way the person who asked would:\n" +
+    "- is anything cut off, outside the window, or overlapping?\n- is any text unreadable (too small, too little contrast)?\n" +
+    "- is anything blank or missing that the app should show, or misaligned?\n- does it look like what was asked for?\n\n" +
+    shots.map((s) => `- ${s.title} (${s.width}×${s.height}): ${s.file}` + (s.errors.length ? `\n  errors while it loaded:\n  ${s.errors.join("\n  ")}` : "")).join("\n") +
+    "\n\nFix only problems you can clearly see; matters of taste are not problems. After a fix, run declare-verify again, and you can take a new picture with `node ../server/look.mjs <app-id>` and read it. " +
+    "End with one short sentence for the person about how it looks now.";
+  const r = await command({ type: "prompt", message: msg });
+  if (!r.success) { console.log("[look] prompt refused: " + r.error); return false; }
+  return true;
 }
 
 // What a set of changed files means for the page: apps only (their open

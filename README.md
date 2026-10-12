@@ -13,7 +13,8 @@ npm start            # → http://127.0.0.1:8850/shell.declare (bound to 0.0.0.0
 ```
 
 Needs Strata serving `qwen3.8-flash-next-iq3_s` on 127.0.0.1:8080 (pi provider
-`strata`). Press **⌘J / Ctrl+J**, click ✦ in the dock, or the ✦ in the corner
+`strata`), set up with images on (`--vision gpu`) and `"input": ["text", "image"]`
+on its entry in `~/.pi/agent/models.json`, so the agent can see its apps. Press **⌘J / Ctrl+J**, click ✦ in the dock, or the ✦ in the corner
 to open the assistant.
 
 ## How it is put together
@@ -43,7 +44,12 @@ and hands the prompt to pi (working in `os/`, with `os/AGENTS.md` as its system
 prompt). pi's events stream back over `/api/events` as small chat operations.
 When pi settles, the bridge runs `declare-verify` on the desktop (if any OS file
 moved), on each app whose folder moved, and checks `apps.json`. Failures go back
-to the agent to fix (twice at most). Then it commits and bumps the revision; the
+to the agent to fix (twice at most). Once it verifies, the bridge takes a
+picture of each changed app at its window size (`server/look.mjs`, headless
+Chrome) and has the agent read it and fix anything visibly wrong — cut off,
+blank, overlapping, unreadable — skipping apps the agent already looked at
+since its last edit. The agent can take the same pictures itself with
+`node ../server/look.mjs <app-id>`. Then it commits and bumps the revision; the
 shell remounts the OS with that revision in its program name, so it is fetched
 fresh. If the desktop itself fails to verify, the revision is not bumped — the
 last good OS keeps running, and the panel offers Undo.
@@ -66,7 +72,8 @@ and run `git --git-dir=state/os.git tag -f factory HEAD`.
 
 Environment: `PI_PROVIDER`, `PI_MODEL` (default `strata` /
 `qwen3.8-flash-next-iq3_s`), `PI_EXTENSIONS=1` to let pi load your extensions
-and MCP servers, `AGENT_PORT`, `STRATA_HEALTH`.
+and MCP servers, `LOOK=0` to skip the post-turn pictures, `CHROME` (path to
+Chrome, if it isn't in `~/.cache/puppeteer`), `DECLARE_URL`, `AGENT_PORT`, `STRATA_HEALTH`.
 
 The window chrome, dock and wallpaper are adapted from the Declare distro's
 desktop example (`apps/desktop/desktop.declare`, MIT).

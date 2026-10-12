@@ -34,7 +34,13 @@ find it). The system files are long.
    `npx declare-verify desktop.declare` for any change to the OS itself.
    Read the error, apply exactly the fix it names, run it again. Repeat until
    it says **clean through R4**. Never finish with a failing check.
-4. Finish with one or two sentences saying what you changed. No code dumps.
+4. Look at an app you made or changed: `node ../server/look.mjs <app-id>`
+   saves a picture of it at its window size and prints the path; read that
+   file to see it. A clean verify only means it compiles — the picture shows
+   whether it fits the window, nothing is cut off or blank, and the text is
+   readable. After your turn you are also shown pictures of the apps you
+   changed; fix what you can clearly see is wrong.
+5. Finish with one or two sentences saying what you changed. No code dumps.
 
 **Talk to the person in their terms.** They see apps, windows, the dock, the
 menu bar — not files. Say "the dock icons are now 44 px", not "set `iconEdge`
