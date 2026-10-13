@@ -431,6 +431,42 @@ class AppWindow extends Window [ width = 640, height = 460,
         dark: boolean = { app.darkMode },
         base: string = { app.osBase + classroot.program.split("/").slice(0, -1).join("/") + "/" },
         store: string = { "/api/store/" + classroot.appId + "/" }
+        ],
+
+    // ✦ in the title bar: the assistant, beside this window, for this app
+    // only. The shell draws the chat; this window tells it where it is (on
+    // open, and whenever it moves or resizes while the chat is open).
+    assisted: boolean = { app.assisting != "" && app.assisting == this.recId },
+    // another window in front: the shell hides the chat with this window
+    covered: boolean = { app.wm.frontId != "" && app.wm.frontId != this.recId },
+    assistRect() -> object {
+        return ({ win: this.recId, app: this.appId, title: this.title, covered: this.covered, dark: this.osDark,
+            x: this.wx, y: this.wy + app.menuBarH, w: this.width, h: this.height })
+        },
+    // the chat is this window's drawer: the corners on its edge go square to join it
+    osDark: boolean = { app.darkMode },          // the chat matches the OS's appearance
+    joinedSide: string = { this.assisted && this.miniT == 0 && !this.covered ? app.assistSide : "" },
+    cornerRadius = { this.joinedSide == "right" ? [this.baseRadius, 0, 0, this.baseRadius]
+        : this.joinedSide == "left" ? [0, this.baseRadius, this.baseRadius, 0]
+        : this.baseRadius + (this.thumbRadius * this.waveMag / Math.max(0.02, this.parkScale) - this.baseRadius) * this.miniT },
+    trackChanges = ["wx", "wy", "width", "height", "covered", "osDark"],
+    toggleAssist() {
+        if (this.assisted) app.post("assist", ({ close: true }))
+        else app.post("assist", this.assistRect())
+        },
+    onChange() {
+        super.onChange()
+        if (this.assisted) app.post("assist", this.assistRect())
+        },
+    assist: View [ x = { parent.width - 34 }, y = { (classroot.barH - 22) / 2 }, width = 24, height = 22, cornerRadius = 6,
+        visible = { classroot.chrome },
+        fill = { classroot.assisted ? 0x7B5CFF : this.hovered ? (app.darkMode ? 0xFFFFFF1F : 0x0000000F) : 0x00000000 },
+        cursor = "pointer", tooltipLabel = { "Ask the assistant to change " + classroot.title },
+        onPointerDown() { classroot.activateOnPress() },
+        onClick() { classroot.toggleAssist() },
+        Text [ x = center, y = center, fontSize = 13,
+            textColor = { classroot.assisted ? 0xFFFFFF : classroot.active ? 0x7B5CFF : provided("theme").textMuted },
+            text = "✦" ]
         ]
     ]
 

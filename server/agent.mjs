@@ -11,8 +11,10 @@
 //   POST /api/abort             stop the running turn
 //   POST /api/undo              revert the last agent change
 //   POST /api/factory           restore the OS to its first commit
-//   POST /api/newchat           fresh agent session + empty transcript
+//   POST /api/newchat {app?, title?}  fresh agent session + empty transcript (for an app: scoped to it)
 //   POST /api/chats/open {id}   go back to a saved chat (its transcript and its pi session)
+//   POST /api/chats/forapp {app, title}  the chat attached to one app's window (its latest, else
+//                               a new one); app "" goes back to the latest general chat
 //   POST /api/chats/delete {id} forget a saved chat
 //   GET|PUT /api/store/<app>/<key>   a tiny JSON store for apps
 
@@ -141,8 +143,11 @@ function flushAppends() {
 // state/chats/<id>.json holds a chat's transcript and the pi session file it
 // belongs to, so going back to a chat brings back the agent's memory of it
 // too. state/chats/index.json names the open one; a restart resumes it.
+// A chat opened from an app window's ✦ belongs to that app (`app`, its id):
+// its prompts tell the agent to stay inside the app, and whatever a turn
+// changes outside it is put back.
 
-const chat = { id: "", title: "", created: 0, updated: 0, sessionFile: "" };
+const chat = { id: "", title: "", created: 0, updated: 0, sessionFile: "", app: "", appTitle: "" };
 const chatFile = (id) => path.join(CHATS, id + ".json");
 const newChatId = () => new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14) + "-" + Math.random().toString(36).slice(2, 6);
 
@@ -165,16 +170,16 @@ function listChats() {
   for (const f of fs.readdirSync(CHATS)) {
     if (!f.endsWith(".json") || f === "index.json") continue;
     const c = readChat(f.slice(0, -5));
-    if (c) out.push({ id: c.id, title: c.title || "Untitled chat", updated: c.updated, count: (c.blocks || []).filter((b) => b.kind === "user").length });
+    if (c) out.push({ id: c.id, title: c.title || "Untitled chat", updated: c.updated, count: (c.blocks || []).filter((b) => b.kind === "user").length, app: c.app || "", appTitle: c.appTitle || "" });
   }
-  if (chat.id && !out.some((c) => c.id === chat.id) && state.blocks.length) out.push({ id: chat.id, title: chat.title, updated: Date.now(), count: 1 });
+  if (chat.id && !out.some((c) => c.id === chat.id) && state.blocks.length) out.push({ id: chat.id, title: chat.title, updated: Date.now(), count: 1, app: chat.app, appTitle: chat.appTitle });
   return out.sort((a, b) => b.updated - a.updated);
 }
-function chatsMsg() { return { op: "chats", current: chat.id, chats: listChats() }; }
+function chatsMsg() { return { op: "chats", current: chat.id, app: chat.app, appTitle: chat.appTitle, chats: listChats() }; }
 function announceChats() { broadcast(chatsMsg()); }
 
-function beginChat() {
-  Object.assign(chat, { id: newChatId(), title: "", created: Date.now(), updated: Date.now(), sessionFile: "" });
+function beginChat(app = "", appTitle = "") {
+  Object.assign(chat, { id: newChatId(), title: "", created: Date.now(), updated: Date.now(), sessionFile: "", app, appTitle });
   state.blocks = [];
   seq = 0;
 }
@@ -183,7 +188,7 @@ function resumeChat() {
   let cur = null;
   try { cur = readChat(JSON.parse(fs.readFileSync(path.join(CHATS, "index.json"), "utf8")).current); } catch {}
   if (!cur) { beginChat(); return; }
-  Object.assign(chat, { id: cur.id, title: cur.title || "", created: cur.created || Date.now(), updated: cur.updated || Date.now(), sessionFile: cur.sessionFile || "" });
+  Object.assign(chat, { id: cur.id, title: cur.title || "", created: cur.created || Date.now(), updated: cur.updated || Date.now(), sessionFile: cur.sessionFile || "", app: cur.app || "", appTitle: cur.appTitle || "" });
   state.blocks = cur.blocks || [];
   seq = state.blocks.reduce((n, b) => Math.max(n, +String(b.id).slice(1) || 0), 0);
 }
@@ -292,7 +297,7 @@ function bashTarget(cmd) {
   return f ? thing(f[0]) : /\bapps\b/.test(cmd) ? "the apps" : "the system";
 }
 function pictureOf(s) {
-  const m = String(s || "").match(/looks\/([\w-]+)\.png|look\.mjs\s+([\w-]+)/);
+  const m = String(s || "").match(/looks\/(\w[\w-]*)\.png|look\.mjs\s+(\w[\w-]*)/);
   return m ? thing(`apps/${m[1] || m[2]}/`) : null;
 }
 function describe(name, a = {}) {
@@ -405,7 +410,7 @@ async function startTurn(text) {
   try {
     if (await commitAll("manual edits")) system("Saved your manual edits as a snapshot first.");
     turn = { prompt: text, before: await head(), repairs: 0, looked: false, seen: new Set() };
-    const r = await command({ type: "prompt", message: text });
+    const r = await command({ type: "prompt", message: chat.app ? scopeNote() + text : text });
     if (!r.success) { system("The agent refused the prompt: " + r.error); finishTurn(false); }
     else if (r.data?.disposition === "handled") finishTurn(false);
   } catch (e) {
@@ -458,9 +463,55 @@ async function verifyChanged(before) {
   return { changed, problems, desktopBad, checked: [...targets] };
 }
 
+// what the agent reads ahead of each prompt in an app's chat (the person
+// sees only their own words)
+function scopeNote() {
+  return `[This chat is attached to the ${chat.appTitle || chat.app} app's window. Change only that app: the files in apps/${chat.app}/ ` +
+    `and its own entry in apps.json. Don't change the OS or any other app — if the request needs that, say so instead.]\n\n`;
+}
+
+// An app's chat changes only that app: anything else the turn touched is
+// put back as it was before the turn (for apps.json: every entry but the
+// app's own). Returns the files it put back.
+async function confine(before, id) {
+  const changed = (await git("diff", "--name-only", before)).split("\n")
+    .concat((await git("ls-files", "--others", "--exclude-standard")).split("\n"))
+    .filter(Boolean);
+  const back = [];
+  for (const f of changed) {
+    if (f.startsWith(`apps/${id}/`)) continue;
+    if (f === "apps.json") {
+      let was, now;
+      try { was = JSON.parse(await git("show", `${before}:apps.json`)); now = JSON.parse(fs.readFileSync(path.join(OS, f), "utf8")); }
+      catch { await git("checkout", before, "--", f); back.push(f); continue; }
+      const mine = (now.apps || []).find((a) => a.id === id);
+      const kept = { ...was, apps: (was.apps || []).map((a) => (a.id === id && mine ? mine : a)) };
+      if (JSON.stringify(kept) !== JSON.stringify(now)) {
+        fs.writeFileSync(path.join(OS, f), JSON.stringify(kept, null, 2) + "\n");
+        back.push(f);
+      }
+      continue;
+    }
+    let existed = true;
+    try { await git("cat-file", "-e", `${before}:${f}`); } catch { existed = false; }
+    if (existed) await git("checkout", before, "--", f);
+    else fs.rmSync(path.join(OS, f), { force: true });
+    back.push(f);
+  }
+  return back;
+}
+
 async function afterTurn(aborted) {
   if (!turn) { finishTurn(false); return; }
   if (!(await dirty())) { finishTurn(false); return; }
+  if (chat.app) {
+    const back = await confine(turn.before, chat.app);
+    if (back.length) {
+      console.log(`[scope] ${chat.app}: put back ${back.join(", ")}`);
+      system(`This chat only changes the ${chat.appTitle || chat.app} app, so I put back the change to ${summaryOf(back)}.`);
+      if (!(await dirty())) { finishTurn(false); return; }
+    }
+  }
   const v = await verifyChanged(turn.before);
   if (v.problems.length && !aborted && turn.repairs < MAX_REPAIRS) {
     turn.repairs++;
@@ -585,12 +636,16 @@ async function factory() {
   return { ok: true };
 }
 
-async function newChat() {
+async function newChat(app = chat.app, appTitle = chat.appTitle) {
   if (state.busy) return { ok: false, error: "busy" };
-  if (state.blocks.length === 0) return { ok: true };    // already a fresh one
+  if (state.blocks.length === 0) {                       // already a fresh one: just (re)scope it
+    Object.assign(chat, { app, appTitle });
+    announceChats();
+    return { ok: true };
+  }
   saveChat();
   if (pi) await command({ type: "new_session" });
-  beginChat();
+  beginChat(app, appTitle);
   if (pi) await noteSession();
   broadcast({ op: "reset", blocks: [] });
   announceChats();
@@ -603,7 +658,7 @@ async function openChat(id) {
   const c = readChat(String(id));
   if (!c) return { ok: false, error: "no such chat" };
   saveChat();
-  Object.assign(chat, { id: c.id, title: c.title || "", created: c.created, updated: c.updated, sessionFile: c.sessionFile || "" });
+  Object.assign(chat, { id: c.id, title: c.title || "", created: c.created, updated: c.updated, sessionFile: c.sessionFile || "", app: c.app || "", appTitle: c.appTitle || "" });
   state.blocks = c.blocks || [];
   seq = state.blocks.reduce((n, b) => Math.max(n, +String(b.id).slice(1) || 0), 0);
   if (pi) {
@@ -614,6 +669,21 @@ async function openChat(id) {
   broadcast({ op: "reset", blocks: state.blocks });
   announceChats();
   return { ok: true };
+}
+
+// the chat for one app's window: the one open if it is that app's, else its
+// latest, else a new one; app "" is the general assistant
+async function chatForApp(app, appTitle) {
+  app = String(app || ""); appTitle = String(appTitle || "");
+  if (app && !/^[\w-]+$/.test(app)) return { ok: false, error: "bad app id" };
+  if (chat.app === app) {
+    if (app && appTitle && chat.appTitle !== appTitle) { chat.appTitle = appTitle; announceChats(); }
+    return { ok: true };
+  }
+  if (state.busy) return { ok: false, error: "busy" };
+  const latest = listChats().find((c) => c.app === app && c.id !== chat.id);
+  if (latest) return openChat(latest.id);
+  return newChat(app, appTitle);
 }
 
 async function deleteChat(id) {
@@ -636,7 +706,7 @@ async function deleteChat(id) {
 }
 async function newChatAfterDelete() {
   if (pi) await command({ type: "new_session" });
-  beginChat();
+  beginChat(chat.app, chat.appTitle);
   if (pi) await noteSession();
   broadcast({ op: "reset", blocks: [] });
 }
@@ -692,7 +762,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && p === "/api/abort") { if (pi && state.busy) await command({ type: "abort" }); return json(res, 200, { ok: true }); }
     if (req.method === "POST" && p === "/api/undo") return json(res, 200, await undo());
     if (req.method === "POST" && p === "/api/factory") return json(res, 200, await factory());
-    if (req.method === "POST" && p === "/api/newchat") return json(res, 200, await newChat());
+    if (req.method === "POST" && p === "/api/newchat") { const b = await body(req); return json(res, 200, await newChat(b.app ?? chat.app, b.title ?? chat.appTitle)); }
+    if (req.method === "POST" && p === "/api/chats/forapp") { const b = await body(req); return json(res, 200, await chatForApp(b.app, b.title)); }
     if (req.method === "POST" && p === "/api/chats/open") return json(res, 200, await openChat((await body(req)).id));
     if (req.method === "POST" && p === "/api/chats/delete") return json(res, 200, await deleteChat((await body(req)).id));
     const m = p.match(/^\/api\/store\/([^/]+)\/([^/]+)$/);

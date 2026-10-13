@@ -64,6 +64,16 @@ refresh restores them too).
 **Chats** are all kept: **History** in the panel lists them, and opening one
 brings back its transcript and the agent's own memory of it (its pi session).
 
+**App chats**: the ✦ in an app window's title bar opens the assistant as that
+window's drawer — joined to its right edge (the left, if there's no room),
+its height, in the OS's light or dark look, following the window as it moves
+and hiding while another window is in front — on that app's own chat: its
+latest one, or a new one. Requests there change only that app: the agent is
+told so with every prompt, and if a turn changes anything outside
+`apps/<id>/` or that app's own `apps.json` entry anyway, the bridge puts it
+back before verifying and says so in the chat. The dock's ✦ or ⌘J returns to
+the general chat.
+
 **Undo** reverts the last agent turn as new commits; **factory reset**
 (`POST /api/factory`) restores the tree at the `factory` tag — on a fresh
 checkout, whatever `os/` held when the bridge first started (`AGENTS.md` is

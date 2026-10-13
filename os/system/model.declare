@@ -158,9 +158,12 @@ class WinManager extends Node [
             const front = r.id == this.frontId
             const id = this.mintId()
             const props = ({ ...(r.props as object), wx: w.wx, wy: w.wy, width: w.width, height: w.height, bornX: -1, bornY: -1, rev: app.rev })
+            const assisted = r.id == app.assisting
+            const rect = ({ app: r.appId, title: w.title, x: w.wx, y: w.wy + app.menuBarH, w: w.width, h: w.height })
             this.removeWin(r.id)
             this.addWin(({ id: id, cls: r.cls, appId: r.appId, mini: false, props: props }))
             if (front) this.frontId = id
+            if (assisted) app.post("assist", ({ ...rect, win: id }))     // the chat stays with the new window
             }
         this.saveSoon()
         },
@@ -197,6 +200,7 @@ class WinManager extends Node [
 
     minimizeWin(w: Window) {
         if (w == null || w.plain || this.isMin(w)) return
+        if (w.recId == app.assisting) app.post("assist", ({ close: true }))
         this.patchWin(w.recId, ({ mini: true, label: this.labelFor(w), winW: w.width, winH: w.height }))
         const from = this.idxOf(w.recId)
         if (from >= 0) this.list.move(["wins"], from, this.recs().length - 1)
@@ -231,6 +235,7 @@ class WinManager extends Node [
     closeWin(w: Window) { w.beginClose() },              // the reverse zoom; removal on its onStop
 
     reallyClose(w: Window) {
+        if (w.recId == app.assisting) app.post("assist", ({ close: true }))
         if (frontId == w.recId) frontId = ""
         this.removeWin(w.recId)
         },

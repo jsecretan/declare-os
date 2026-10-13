@@ -115,6 +115,8 @@ App [ appName = "Declare OS", scrolls = none,
     rev: number = { hostProvided("rev", 0) },        // bumped on every agent change
     changedApps: string = { hostProvided("changed", "") },   // with a rev that touched only apps: their ids, comma-separated
     session: string = { hostProvided("session", "") },       // the windows open before the page last reloaded (JSON)
+    assisting: string = { hostProvided("assisting", "") },   // the window whose ✦ chat is open beside it (its record id)
+    assistSide: string = { hostProvided("assistSide", "") }, // the edge that chat is joined to: "right" | "left" | "float"
 
     // An app's program path, relative to this folder ("apps/clock/clock"),
     // as an island names it. Island names resolve from the page's demos/
