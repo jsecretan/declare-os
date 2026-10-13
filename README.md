@@ -7,6 +7,11 @@ timer") or a change to the OS itself ("make the dock icons smaller"); a
 [pi](https://github.com/earendil-works/pi) agent running the local Strata model edits the
 Declare source, the bridge verifies it, and the OS reloads live.
 
+<p align="center">
+  <a href="docs/intro.mp4"><img src="docs/intro.gif" width="880" alt="Asking the assistant for a color palette app, then using that app's own assistant drawer to restyle it"></a>
+  <br><sub>Real time except the agent's turns, which are sped up. <a href="docs/intro.mp4">MP4 version</a></sub>
+</p>
+
 ```
 npm install
 npm start            # → http://127.0.0.1:8850/shell.declare (bound to 0.0.0.0, so http://<lan-ip>:8850 works too)
@@ -14,8 +19,56 @@ npm start            # → http://127.0.0.1:8850/shell.declare (bound to 0.0.0.0
 
 Needs Strata serving `qwen3.8-flash-next-iq3_s` on 127.0.0.1:8080 (pi provider
 `strata`), set up with images on (`--vision gpu`) and `"input": ["text", "image"]`
-on its entry in `~/.pi/agent/models.json`, so the agent can see its apps. Press **⌘J / Ctrl+J**, click ✦ in the dock, or the ✦ in the corner
+on its entry in `~/.pi/agent/models.json`, so the agent can see its apps — or
+any hosted model pi supports (see [Using a hosted model](#using-a-hosted-model)). Press **⌘J / Ctrl+J**, click ✦ in the dock, or the ✦ in the corner
 to open the assistant.
+
+## Using a hosted model
+
+The agent is [pi](https://github.com/earendil-works/pi), so any model pi can
+reach works in place of Strata. Set the provider's key, and name the provider
+and model with `PI_PROVIDER` and `PI_MODEL`:
+
+```
+export ANTHROPIC_API_KEY=sk-ant-…
+PI_PROVIDER=anthropic PI_MODEL=claude-sonnet-5-5 npm start
+```
+
+The same pattern works for pi's other built-in providers: `OPENAI_API_KEY`
+with `PI_PROVIDER=openai`, `GEMINI_API_KEY` with `google`, `OPENROUTER_API_KEY`
+with `openrouter`, and so on (`pi --help` lists the key variables). Once a key
+is set, `pi --list-models` shows the model ids you can use and
+`pi auth check --provider <name>` confirms pi can reach it. `PI_MODEL` also
+takes the `provider/id` form.
+
+For any other OpenAI-compatible server (Ollama, LM Studio, vLLM, a gateway),
+add it to `~/.pi/agent/models.json` the way Strata is set up:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "apiKey": "ollama",
+      "models": [
+        { "id": "qwen3.8:27b", "contextWindow": 131072, "input": ["text", "image"], "reasoning": true }
+      ]
+    }
+  }
+}
+```
+
+then `PI_PROVIDER=ollama PI_MODEL=qwen3.8:27b npm start`.
+
+Notes:
+- The look pass sends the model pictures of the apps it changed, so the model
+  needs image input. With a text-only model, start with `LOOK=0`.
+- With a provider other than `strata`, the panel's status dot no longer polls
+  Strata and shows ready. To poll a local server's health endpoint anyway,
+  set `STRATA_HEALTH` to its URL.
+- Each turn sends the OS's source files and the agent's instructions to that
+  provider.
 
 ## How it is put together
 

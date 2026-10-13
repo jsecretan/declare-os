@@ -37,7 +37,9 @@ const VERIFY = path.join(ROOT, "node_modules/declarelang/tools/verify.mjs");
 const PORT = +(process.env.AGENT_PORT || 8851);
 const PROVIDER = process.env.PI_PROVIDER || "strata";
 const MODEL = process.env.PI_MODEL || "qwen3.8-flash-next-iq3_s";
-const STRATA_HEALTH = process.env.STRATA_HEALTH || "http://127.0.0.1:8080/health";
+// the status dot polls Strata; a hosted model has no health endpoint to poll,
+// so it shows as ready (set STRATA_HEALTH to poll a local server anyway)
+const STRATA_HEALTH = process.env.STRATA_HEALTH || (PROVIDER === "strata" ? "http://127.0.0.1:8080/health" : "");
 const MAX_REPAIRS = 2;
 // after a clean verify, take pictures of the changed apps and let the model
 // check them once (LOOK=0 turns it off; it needs an image-capable model)
@@ -714,6 +716,7 @@ async function newChatAfterDelete() {
 // ── the model's health, for the panel's status dot ──────────────────────
 
 async function pollModel() {
+  if (!STRATA_HEALTH) { if (state.model !== "ready") setState({ model: "ready" }); return; }
   let model = "offline";
   try {
     const r = await fetch(STRATA_HEALTH, { signal: AbortSignal.timeout(2500) });
